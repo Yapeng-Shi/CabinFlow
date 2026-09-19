@@ -1,0 +1,18 @@
+# CMake and compiler output
+**/build/
+**/install/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/compile_commands.json
+**/Testing/
+
+# Local development state
+**/.vscode/
+**/__pycache__/
+**/.pytest_cache/
+
+# Optional model artifacts. The source working tree contains Git LFS pointers
+# only; their LFS objects are not available locally for this initial import.
+/agent/tts/models/single_speaker_fast.bin
+/agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/encoder-epoch-99-avg-1.onnx
+/agent/automotive_edge_rag/models/model.safetensors

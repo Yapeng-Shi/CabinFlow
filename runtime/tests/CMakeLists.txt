@@ -1,0 +1,4 @@
+add_executable(runtime_build_sanity runtime_build_sanity.cpp)
+target_link_libraries(runtime_build_sanity PRIVATE CabinFlow::Runtime)
+
+add_test(NAME runtime_build_sanity COMMAND runtime_build_sanity)
