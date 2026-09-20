@@ -2,16 +2,16 @@
 
 ## Status
 
-Accepted for implementation in week one; the Protobuf schema follows in the
-protocol task.
+The C++ metadata contract, Protobuf schema, and codec are implemented in
+`CabinFlow::Protocol` and covered by `message_codec_test`.
 
 ## Decision
 
 All new runtime messages will use a versioned envelope. The envelope owns
 identity, ordering, delivery bounds, source and target metadata. Business
-payloads remain separate from transport metadata.
+payloads remain in `protocol::Message`, separate from transport metadata.
 
-The first schema will include:
+The C++ envelope currently includes:
 
 - `schema_version`
 - `message_id`
@@ -20,13 +20,16 @@ The first schema will include:
 - `work_id`
 - `source_node`, `target_node`, and `topic`
 - `sequence`, `created_monotonic_ns`, and `ttl_ms`
-- `is_final`
-- a typed payload or structured error
+- `is_final` and `kind` (`data`, `cancel`, or `error`)
+
+The Protobuf schema carries this metadata and a byte payload without changing
+Runtime ownership rules. Agent-specific typed payload and error schemas remain
+outside Runtime.
 
 ## Consequences
 
-- Legacy raw strings such as sentinel end markers are confined behind an
-  adapter during migration.
+- Legacy raw strings such as sentinel end markers will be confined behind an
+  adapter when their transport migration starts.
 - Unsupported schema versions and expired messages fail explicitly.
 - Ordering and cancellation are defined per session and work stream, rather
   than through process-global state.

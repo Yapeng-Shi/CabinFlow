@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package cabinflow.protocol.v1;
+
+enum WireMessageKind {
+  WIRE_MESSAGE_KIND_UNSPECIFIED = 0;
+  WIRE_MESSAGE_KIND_DATA = 1;
+  WIRE_MESSAGE_KIND_CANCEL = 2;
+  WIRE_MESSAGE_KIND_ERROR = 3;
+}
+
+enum WireSeatPosition {
+  WIRE_SEAT_POSITION_UNKNOWN = 0;
+  WIRE_SEAT_POSITION_DRIVER = 1;
+  WIRE_SEAT_POSITION_FRONT_PASSENGER = 2;
+  WIRE_SEAT_POSITION_REAR_LEFT = 3;
+  WIRE_SEAT_POSITION_REAR_CENTER = 4;
+  WIRE_SEAT_POSITION_REAR_RIGHT = 5;
+}
+
+message RuntimeMessage {
+  uint32 schema_version = 1;
+  string message_id = 2;
+  string trace_id = 3;
+  string session_id = 4;
+  string work_id = 5;
+  string source_node = 6;
+  string target_node = 7;
+  string topic = 8;
+  WireMessageKind kind = 9;
+  WireSeatPosition seat = 10;
+  uint64 sequence = 11;
+  uint64 created_monotonic_ns = 12;
+  uint32 ttl_ms = 13;
+  bool is_final = 14;
+  bytes payload = 15;
+}

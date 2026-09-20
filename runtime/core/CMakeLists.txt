@@ -1,0 +1,25 @@
+add_library(cabinflow_runtime
+    src/cancellation.cpp
+    src/clock.cpp
+    src/runtime.cpp
+    src/session_ledger.cpp
+)
+add_library(CabinFlow::Runtime ALIAS cabinflow_runtime)
+
+target_include_directories(cabinflow_runtime
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
+target_link_libraries(cabinflow_runtime
+    PUBLIC
+        CabinFlow::Observability
+        CabinFlow::Protocol
+        CabinFlow::TransportApi
+)
+
+target_compile_features(cabinflow_runtime PUBLIC cxx_std_17)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(cabinflow_runtime PRIVATE -Wall -Wextra -Wpedantic)
+endif()
