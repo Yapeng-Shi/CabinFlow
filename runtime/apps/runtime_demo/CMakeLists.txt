@@ -16,6 +16,7 @@ target_link_libraries(runtime_demo_nodes
 )
 
 target_compile_features(runtime_demo_nodes PUBLIC cxx_std_17)
+cabinflow_enable_compiler_warnings(runtime_demo_nodes)
 
 add_executable(runtime_demo main.cpp)
 target_link_libraries(runtime_demo
@@ -23,3 +24,5 @@ target_link_libraries(runtime_demo
         runtime_demo_nodes
         CabinFlow::TransportInMemory
 )
+target_compile_features(runtime_demo PRIVATE cxx_std_17)
+cabinflow_enable_compiler_warnings(runtime_demo)

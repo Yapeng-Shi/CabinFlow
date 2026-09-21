@@ -2,8 +2,8 @@
 
 #include <string>
 
-#include <cabinflow/protocol/codec_error.hpp>
 #include <cabinflow/protocol/message.hpp>
+#include <cabinflow/protocol/protocol_error.hpp>
 
 namespace cabinflow::protocol {
 

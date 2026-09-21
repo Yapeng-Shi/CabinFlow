@@ -10,7 +10,7 @@ cmake --build --preset linux-asan
 ctest --preset linux-asan
 ```
 
-Verified on 2026-09-20 in Ubuntu 24.04 on WSL with GCC 13.3.0: all ten CTest
+Verified on 2026-09-20 in Ubuntu 24.04 on WSL with GCC 13.3.0: all twelve CTest
 cases passed under AddressSanitizer. This validates the current local test
 paths only; it is not target-hardware validation.
 

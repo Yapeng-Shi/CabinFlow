@@ -1,0 +1,2 @@
+# libglog 在并发日志时间戳计算中调用 libc tzset；仅屏蔽该第三方报告，保留 network 代码的竞态诊断。
+race:google::LogMessageTime::CalcGmtOffset

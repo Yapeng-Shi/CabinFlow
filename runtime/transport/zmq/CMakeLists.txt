@@ -21,7 +21,4 @@ target_link_libraries(cabinflow_transport_zmq
 )
 
 target_compile_features(cabinflow_transport_zmq PUBLIC cxx_std_17)
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(cabinflow_transport_zmq PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+cabinflow_enable_compiler_warnings(cabinflow_transport_zmq)

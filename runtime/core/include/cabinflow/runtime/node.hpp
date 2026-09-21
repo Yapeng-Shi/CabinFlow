@@ -9,7 +9,7 @@ namespace cabinflow::runtime {
 
 class Node {
 public:
-    virtual ~Node() = default;
+    virtual ~Node();
 
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
     [[nodiscard]] virtual RuntimeError start(NodeContext& context) = 0;

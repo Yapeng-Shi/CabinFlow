@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package cabinflow.agent.v1;
+
+message TextInput {
+  string text = 1;
+}

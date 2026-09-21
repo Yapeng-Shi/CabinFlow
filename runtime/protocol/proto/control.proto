@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package cabinflow.protocol.v1;
+
+enum WorkState {
+  WORK_STATE_UNSPECIFIED = 0;
+  WORK_STATE_RUNNING = 1;
+  WORK_STATE_PAUSED = 2;
+  WORK_STATE_EXITED = 3;
+}
+
+enum UnitState {
+  UNIT_STATE_UNSPECIFIED = 0;
+  UNIT_STATE_READY = 1;
+  UNIT_STATE_BUSY = 2;
+  UNIT_STATE_STOPPING = 3;
+}
+
+enum TaskInfoScope {
+  TASK_INFO_SCOPE_UNSPECIFIED = 0;
+  TASK_INFO_SCOPE_WORK = 1;
+  TASK_INFO_SCOPE_SESSION = 2;
+}
+
+message SetupRequest {
+  string unit_id = 1;
+}
+
+message PauseRequest {
+  string reason = 1;
+}
+
+message ExitRequest {
+  string reason = 1;
+}
+
+message TaskInfoRequest {
+  TaskInfoScope scope = 1;
+}
+
+message RegisterUnitRequest {
+  string unit_id = 1;
+  repeated string capabilities = 2;
+  uint32 max_concurrent_work = 3;
+}
+
+message ControlRequest {
+  oneof command {
+    SetupRequest setup = 1;
+    PauseRequest pause = 2;
+    ExitRequest exit = 3;
+    TaskInfoRequest task_info = 4;
+    RegisterUnitRequest register_unit = 5;
+  }
+}
+
+message WorkInfo {
+  string work_id = 1;
+  string unit_id = 2;
+  WorkState state = 3;
+}
+
+message SetupResponse {
+  WorkInfo work = 1;
+}
+
+message PauseResponse {
+  WorkInfo work = 1;
+}
+
+message ExitResponse {
+  WorkInfo work = 1;
+}
+
+message TaskInfoResponse {
+  repeated WorkInfo works = 1;
+}
+
+message RegisterUnitResponse {
+  string unit_id = 1;
+  UnitState state = 2;
+}
+
+message ControlError {
+  uint32 code = 1;
+  string message = 2;
+}
+
+message ControlResponse {
+  string request_message_id = 16;
+
+  oneof result {
+    SetupResponse setup = 1;
+    PauseResponse pause = 2;
+    ExitResponse exit = 3;
+    TaskInfoResponse task_info = 4;
+    RegisterUnitResponse register_unit = 5;
+    ControlError error = 15;
+  }
+}

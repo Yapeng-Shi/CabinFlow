@@ -1,8 +1,10 @@
 add_library(cabinflow_runtime
     src/cancellation.cpp
     src/clock.cpp
+    src/node.cpp
     src/runtime.cpp
     src/session_ledger.cpp
+    src/unit_registry.cpp
 )
 add_library(CabinFlow::Runtime ALIAS cabinflow_runtime)
 
@@ -19,7 +21,4 @@ target_link_libraries(cabinflow_runtime
 )
 
 target_compile_features(cabinflow_runtime PUBLIC cxx_std_17)
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(cabinflow_runtime PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+cabinflow_enable_compiler_warnings(cabinflow_runtime)

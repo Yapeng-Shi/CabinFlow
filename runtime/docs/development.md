@@ -23,11 +23,12 @@ The same workflow is available from any directory through:
 
 The generated files are placed under `build/`, which is already ignored by Git.
 
-## Legacy baseline
+## Historical baseline and migration input
 
-The current standalone `infra-controller` configuration depends on `eventpp`.
-It is deliberately not included in the root build until that dependency is
-captured by a reproducible development environment.
+The standalone Runtime trees are retained as migration input but are not an
+active build path. `baseline.md` records the original dependency observation;
+`capability-migration.md` records the test-first decision and deletion
+boundary for each legacy capability.
 
 ## Runtime core and lifecycle
 
@@ -86,6 +87,21 @@ Build and run it explicitly when changing queue synchronization:
 cmake --build build/linux-debug --target bounded_queue_stress_test
 ./build/linux-debug/tests/bounded_queue_stress_test
 ```
+
+## Typed TCP data plane
+
+`TargetNode` is Runtime's generic data-plane interface. Runtime owns a unique
+target-name mapping, a bounded queue, and one worker for each target. Gateway
+reserves a target slot before it admits the envelope to `SessionLedger`; only
+an accepted envelope is committed to the queue. Payload parsing remains in the
+Agent node, so Runtime and Gateway do not link `CabinFlow::AgentProtocol`.
+
+The first Agent path is `cockpit.text.input -> dialogue.primary`. It uses a
+Protobuf `TextInput`; empty, malformed, invalid UTF-8, or unsupported-topic
+messages receive typed `runtime.delivery.error` responses. Successful handling
+does not receive an ACK. The direct Runtime, response-contract, and real TCP
+checks are included in default CTest as `target_runtime_contract_test`,
+`delivery_error_contract_test`, and `data_plane_gateway_tcp_test`.
 
 ## Runtime demo
 

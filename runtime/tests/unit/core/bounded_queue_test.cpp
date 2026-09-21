@@ -42,5 +42,40 @@ int main() {
         return 1;
     }
 
+    BoundedQueue<int> reserved_queue(1);
+    {
+        auto reservation = reserved_queue.try_reserve();
+        if (!expect(static_cast<bool>(reservation), "queue capacity can be reserved") ||
+            !expect(reserved_queue.reserved_size() == 1,
+                    "reservation is visible to backpressure") ||
+            !expect(reserved_queue.try_push(99) == QueuePushResult::kFull,
+                    "reserved capacity rejects competing enqueue") ||
+            !expect(reservation.reservation.commit(42) ==
+                        cabinflow::runtime::QueueCommitResult::kCommitted,
+                    "reserved capacity commits without a second full check")) {
+            return 1;
+        }
+    }
+    const auto committed = reserved_queue.wait_pop();
+    if (!expect(committed.has_value() && *committed == 42,
+                "committed reservation reaches consumer") ||
+        !expect(reserved_queue.reserved_size() == 0,
+                "commit releases the reservation count")) {
+        return 1;
+    }
+
+    BoundedQueue<int> stopped_queue(1);
+    if (!expect(stopped_queue.try_push(7) == QueuePushResult::kAccepted,
+                "queue accepts item before stop")) {
+        return 1;
+    }
+    stopped_queue.close_and_discard();
+    if (!expect(!stopped_queue.wait_pop().has_value(),
+                "stopped queue discards work before handler execution") ||
+        !expect(stopped_queue.try_push(8) == QueuePushResult::kClosed,
+                "stopped queue no longer accepts messages")) {
+        return 1;
+    }
+
     return 0;
 }
