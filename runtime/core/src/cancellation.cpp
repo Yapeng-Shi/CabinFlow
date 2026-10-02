@@ -51,14 +51,23 @@ bool CancellationToken::valid() const noexcept {
 }
 
 bool CancellationToken::cancelled() const noexcept {
+    return reason() != CancellationReason::kNone;
+}
+
+CancellationReason CancellationToken::reason() const noexcept {
     if (!valid()) {
-        return false;
+        return CancellationReason::kNone;
     }
 
     std::lock_guard<std::mutex> lock(state_->mutex);
     // session 级取消覆盖该 session 下所有 work；work 级取消只影响精确 pair。
-    return state_->cancelled_sessions.count(session_id_) != 0U ||
-           state_->cancelled_work.count({session_id_, work_id_}) != 0U;
+    if (state_->cancelled_sessions.count(session_id_) != 0U) {
+        return CancellationReason::kSession;
+    }
+    if (state_->cancelled_work.count({session_id_, work_id_}) != 0U) {
+        return CancellationReason::kWork;
+    }
+    return CancellationReason::kNone;
 }
 
 CancellationRegistry::CancellationRegistry()

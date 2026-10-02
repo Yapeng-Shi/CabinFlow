@@ -19,6 +19,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <cockpit_text.pb.h>
 #include <control.pb.h>
@@ -136,16 +137,23 @@ class GatewayFixture final {
 public:
     GatewayFixture()
         : runtime_(transport_, clock_, logger_) {
+        loop_thread_.run_and_wait([this] {
+            gateway_ = std::make_unique<cabinflow::gateway::ControlGateway>(
+                loop_thread_.loop(), "data-gateway-test", "127.0.0.1", 0,
+                registry_, runtime_, clock_, 500);
+        });
         require(runtime_.add_target_node(
-                    std::make_unique<cabinflow::agent::DialogueTextNode>(), 8) ==
+                    std::make_unique<cabinflow::agent::DialogueTextNode>(
+                        [this](const cabinflow::protocol::MessageEnvelope& request,
+                               std::string_view topic, std::string payload) {
+                            return gateway_->send_data_output(request, topic,
+                                                              std::move(payload));
+                        }), 8) ==
                     cabinflow::runtime::RuntimeError::kNone,
                 "dialogue target registers");
         require(runtime_.start() == cabinflow::runtime::RuntimeError::kNone,
                 "runtime starts before gateway accepts data");
         loop_thread_.run_and_wait([this] {
-            gateway_ = std::make_unique<cabinflow::gateway::ControlGateway>(
-                loop_thread_.loop(), "data-gateway-test", "127.0.0.1", 0,
-                registry_, runtime_, clock_, 500);
             gateway_->start();
             port_ = gateway_->bound_port();
         });
@@ -272,6 +280,17 @@ void wait_for_dialogue_event(cabinflow::test::RecordingLogger& logger,
     throw std::runtime_error("dialogue target did not receive typed text");
 }
 
+std::vector<std::string> dialogue_message_ids(
+    const cabinflow::test::RecordingLogger& logger) {
+    std::vector<std::string> ids;
+    for (const auto& event : logger.snapshot()) {
+        if (event.component == "dialogue" && event.name == "text_input_received") {
+            ids.push_back(event.message_id);
+        }
+    }
+    return ids;
+}
+
 Message make_control(std::string message_id, std::string session_id,
                      std::string work_id,
                      const cabinflow::protocol::v1::ControlRequest& request) {
@@ -283,6 +302,8 @@ Message make_control(std::string message_id, std::string session_id,
     message.envelope.source_node = "tcp-client";
     message.envelope.target_node = "control-gateway";
     message.envelope.topic = "control.request";
+    message.envelope.created_monotonic_ns =
+        cabinflow::runtime::SteadyClock{}.now_monotonic_ns();
     message.envelope.ttl_ms = 1'000;
     require(request.SerializeToString(&message.payload), "serialize control request");
     return message;
@@ -368,7 +389,7 @@ void test_typed_data_plane_over_tcp() {
     const auto now = fixture.clock().now_monotonic_ns();
     send_message(client.get(), make_data("text-0", work_id, "dialogue.primary",
                                          "cockpit.text.input", 0, now, 1'000,
-                                         text_payload("turn on seat heating")), true);
+                                         text_payload("打")), true);
     wait_for_dialogue_event(fixture.logger(), 1);
     expect_no_response(client.get());
 
@@ -409,19 +430,174 @@ void test_typed_data_plane_over_tcp() {
     read_delivery_error(client.get(), "expired-before-enqueue",
                         cabinflow::protocol::v1::DELIVERY_ERROR_DEADLINE_EXCEEDED);
 
-    send_message(client.get(), make_data("text-final", work_id, "dialogue.primary",
-                                         "cockpit.text.input", 4,
+    send_message(client.get(), make_data("expired-unknown-target", work_id,
+                                         "missing.target", "cockpit.text.expired", 0,
+                                         expired_created, 1, text_payload("expired")));
+    read_delivery_error(client.get(), "expired-unknown-target",
+                        cabinflow::protocol::v1::DELIVERY_ERROR_DEADLINE_EXCEEDED);
+
+    send_message(client.get(), make_data("text-partial-1", work_id,
+                                         "dialogue.primary", "cockpit.text.input", 4,
                                          fixture.clock().now_monotonic_ns(), 1'000,
-                                         text_payload("final text"), true));
-    wait_for_dialogue_event(fixture.logger(), 2);
+                                         text_payload("开")));
+    send_message(client.get(), make_data("text-partial-2", work_id,
+                                         "dialogue.primary", "cockpit.text.input", 5,
+                                         fixture.clock().now_monotonic_ns(), 1'000,
+                                         text_payload("空")));
+    wait_for_dialogue_event(fixture.logger(), 3);
+    require(dialogue_message_ids(fixture.logger()) ==
+                std::vector<std::string>{"text-0", "text-partial-1",
+                                         "text-partial-2"},
+            "partial TextInput reaches the target in sequence order");
+    expect_no_response(client.get());
+
+    const auto final_client = connect_client(fixture.port());
+    auto final_input = make_data(
+        "text-final", work_id, "dialogue.primary", "cockpit.text.input", 6,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("调"), true);
+    final_input.envelope.seat = cabinflow::protocol::SeatPosition::kDriver;
+    send_message(final_client.get(), final_input);
+    wait_for_dialogue_event(fixture.logger(), 4);
+    const auto output_message = read_message(final_client.get());
+    cabinflow::agent::v1::TextOutput output;
+    require(output.ParseFromString(output_message.payload) &&
+                output.request_message_id() == "text-final" &&
+                output.intent() == cabinflow::agent::v1::COCKPIT_INTENT_CLIMATE_ON &&
+                output.text().find("未执行车控") != std::string::npos,
+            "final text recognizes climate intent without executing vehicle control");
+    require(output_message.envelope.topic == "cockpit.text.output" &&
+                output_message.envelope.message_id != "text-final" &&
+                output_message.envelope.trace_id == "trace-data" &&
+                output_message.envelope.session_id == "session-text" &&
+                output_message.envelope.work_id == work_id &&
+                output_message.envelope.source_node == "dialogue.primary" &&
+                output_message.envelope.target_node == "tcp-client" &&
+                output_message.envelope.seat ==
+                    cabinflow::protocol::SeatPosition::kDriver &&
+                output_message.envelope.sequence == 0 &&
+                output_message.envelope.is_final,
+            "output has independent identity and follows the input work");
     expect_no_response(client.get());
 
     send_message(client.get(), make_data("after-final", work_id, "dialogue.primary",
-                                         "cockpit.text.input", 5,
+                                         "cockpit.text.input", 7,
                                          fixture.clock().now_monotonic_ns(), 1'000,
                                          text_payload("must reject")));
     read_delivery_error(client.get(), "after-final",
                         cabinflow::protocol::v1::DELIVERY_ERROR_STREAM_FINALIZED);
+}
+
+void test_rule_based_intents() {
+    const auto run_case = [](std::string_view text,
+                             cabinflow::agent::v1::CockpitIntent expected) {
+        GatewayFixture fixture;
+        const auto client = connect_client(fixture.port());
+        const auto work_id = register_and_setup(client.get());
+        send_message(client.get(), make_data(
+            "intent-final", work_id, "dialogue.primary", "cockpit.text.input", 0,
+            fixture.clock().now_monotonic_ns(), 1'000,
+            text_payload(std::string(text)), true));
+        const auto message = read_message(client.get());
+        cabinflow::agent::v1::TextOutput output;
+        require(message.envelope.topic == "cockpit.text.output" &&
+                    output.ParseFromString(message.payload) &&
+                    output.request_message_id() == "intent-final" &&
+                    output.intent() == expected &&
+                    output.text().find("未执行车控") != std::string::npos,
+                "rule-based output identifies only the stated cockpit intent");
+        expect_no_response(client.get());
+    };
+
+    run_case("关闭空调", cabinflow::agent::v1::COCKPIT_INTENT_CLIMATE_OFF);
+    run_case("打开座椅加热",
+             cabinflow::agent::v1::COCKPIT_INTENT_SEAT_HEATING_ON);
+    run_case("关闭座椅加热",
+             cabinflow::agent::v1::COCKPIT_INTENT_SEAT_HEATING_OFF);
+    run_case("播放音乐", cabinflow::agent::v1::COCKPIT_INTENT_UNRECOGNIZED);
+}
+
+void test_exit_rejects_later_data_without_cancelling_other_work() {
+    GatewayFixture fixture;
+    const auto client = connect_client(fixture.port());
+    const auto work_id = register_and_setup(client.get());
+
+    cabinflow::protocol::v1::ControlRequest exit;
+    exit.mutable_exit()->set_reason("user requested stop");
+    send_message(client.get(), make_control("exit-wrong-session", "other-session",
+                                            work_id, exit));
+    cabinflow::protocol::v1::ControlResponse rejected_exit;
+    require(rejected_exit.ParseFromString(read_message(client.get()).payload) &&
+                rejected_exit.has_error(),
+            "another session cannot exit this work");
+
+    send_message(client.get(), make_data(
+        "before-exit", work_id, "dialogue.primary", "cockpit.text.input", 0,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("打开")));
+    wait_for_dialogue_event(fixture.logger(), 1);
+
+    send_message(client.get(), make_control("exit-work", "session-text", work_id,
+                                            exit));
+    const auto exit_message = read_message(client.get());
+    cabinflow::protocol::v1::ControlResponse exited;
+    require(exited.ParseFromString(exit_message.payload) && exited.has_exit() &&
+                exited.exit().work().work_id() == work_id &&
+                exited.exit().work().state() ==
+                    cabinflow::protocol::v1::WORK_STATE_EXITED,
+            "successful Exit transitions the registered work");
+
+    const auto another_client = connect_client(fixture.port());
+    send_message(another_client.get(), make_data(
+        "after-exit", work_id, "dialogue.primary", "cockpit.text.input", 1,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("空调")));
+    read_delivery_error(another_client.get(), "after-exit",
+                        cabinflow::protocol::v1::DELIVERY_ERROR_WORK_CANCELLED);
+    require(dialogue_message_ids(fixture.logger()) ==
+                std::vector<std::string>{"before-exit"},
+            "exited work does not deliver later data to the target");
+
+    cabinflow::protocol::v1::ControlRequest setup;
+    setup.mutable_setup()->set_unit_id("dialogue.primary");
+    send_message(client.get(), make_control("setup-after-exit", "session-text", "",
+                                            setup));
+    cabinflow::protocol::v1::ControlResponse new_setup;
+    require(new_setup.ParseFromString(read_message(client.get()).payload) &&
+                new_setup.has_setup() &&
+                new_setup.setup().work().work_id() != work_id,
+            "Exit releases unit capacity for a new work");
+    send_message(client.get(), make_data(
+        "new-work", new_setup.setup().work().work_id(), "dialogue.primary",
+        "cockpit.text.input", 0, fixture.clock().now_monotonic_ns(), 1'000,
+        text_payload("关闭")));
+    wait_for_dialogue_event(fixture.logger(), 2);
+}
+
+void test_work_identity_is_checked_before_ledger_admission() {
+    GatewayFixture fixture;
+    const auto client = connect_client(fixture.port());
+    const auto work_id = register_and_setup(client.get());
+
+    send_message(client.get(), make_data(
+        "missing-work", "work-not-created", "dialogue.primary",
+        "cockpit.text.input", 0, fixture.clock().now_monotonic_ns(), 1'000,
+        text_payload("打开")));
+    read_delivery_error(client.get(), "missing-work",
+                        cabinflow::protocol::v1::DELIVERY_ERROR_WORK_NOT_FOUND);
+
+    auto foreign_work = make_data(
+        "foreign-work", work_id, "dialogue.primary", "cockpit.text.input", 0,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("打开"));
+    foreign_work.envelope.session_id = "another-session";
+    send_message(client.get(), foreign_work);
+    read_delivery_error(client.get(), "foreign-work",
+                        cabinflow::protocol::v1::DELIVERY_ERROR_WORK_NOT_FOUND);
+
+    send_message(client.get(), make_data(
+        "valid-work", work_id, "dialogue.primary", "cockpit.text.input", 0,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("打开")));
+    wait_for_dialogue_event(fixture.logger(), 1);
+    require(dialogue_message_ids(fixture.logger()) ==
+                std::vector<std::string>{"valid-work"},
+            "rejected work identities do not enter the target or poison Ledger");
 }
 
 }  // namespace
@@ -429,6 +605,9 @@ void test_typed_data_plane_over_tcp() {
 int main() {
     try {
         test_typed_data_plane_over_tcp();
+        test_rule_based_intents();
+        test_exit_rejects_later_data_without_cancelling_other_work();
+        test_work_identity_is_checked_before_ledger_admission();
         std::cout << "data plane gateway tcp test passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -23,6 +23,7 @@
 #include <control.pb.h>
 
 #include <cabinflow/gateway/control_gateway.hpp>
+#include <cabinflow/gateway/control_service.hpp>
 #include <cabinflow/gateway/runtime_message_framer.hpp>
 #include <cabinflow/net/event_loop.hpp>
 #include <cabinflow/observability/logger.hpp>
@@ -266,6 +267,8 @@ Message make_request(std::string message_id, std::string session_id,
     message.envelope.target_node = "control-gateway";
     message.envelope.topic = "control.request";
     message.envelope.kind = MessageKind::kData;
+    message.envelope.created_monotonic_ns =
+        cabinflow::runtime::SteadyClock{}.now_monotonic_ns();
     message.envelope.ttl_ms = 1000;
     require(request.SerializeToString(&message.payload), "serialize request payload");
     return message;
@@ -310,6 +313,19 @@ void test_control_gateway_over_tcp() {
 
         ControlRequest setup;
         setup.mutable_setup()->set_unit_id("asr.primary");
+        auto expired_setup = make_request("setup-expired", "session-1", "", setup);
+        expired_setup.envelope.created_monotonic_ns = 0;
+        send_request(client.get(), expired_setup, false);
+        const auto expired_message = read_message(client.get());
+        const auto expired_response = parse_control_response(expired_message);
+        require(expired_response.has_error() &&
+                    expired_response.request_message_id() == "setup-expired" &&
+                    expired_response.error().code() == static_cast<std::uint32_t>(
+                        cabinflow::gateway::ControlErrorCode::kDeadlineExceeded) &&
+                    expired_message.envelope.kind == MessageKind::kError &&
+                    expired_message.envelope.work_id.empty(),
+                "expired setup returns a correlated error without creating work");
+
         send_request(client.get(), make_request("setup-1", "session-1", "", setup), false);
         const auto setup_message = read_message(client.get());
         const auto setup_response = parse_control_response(setup_message);

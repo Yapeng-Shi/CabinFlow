@@ -39,6 +39,7 @@ struct Gate {
     bool entered{false};
     bool released{false};
     std::size_t handled{0};
+    std::vector<std::string> message_ids;
 
     void wait_until_entered() {
         std::unique_lock<std::mutex> lock(mutex);
@@ -77,10 +78,11 @@ public:
     void stop() noexcept override {}
 
     [[nodiscard]] cabinflow::runtime::MessageHandlingResult on_message(
-        const cabinflow::protocol::Message&) noexcept override {
+        const cabinflow::protocol::Message& message) noexcept override {
         std::unique_lock<std::mutex> lock(gate_.mutex);
         gate_.entered = true;
         ++gate_.handled;
+        gate_.message_ids.push_back(message.envelope.message_id);
         gate_.changed.notify_all();
         while (gate_.block && !gate_.released) {
             gate_.changed.wait(lock);
@@ -159,6 +161,8 @@ void test_registration_and_reservation_invariants() {
             "duplicate target name is rejected");
     require(runtime.start() == cabinflow::runtime::RuntimeError::kNone,
             "runtime starts target worker");
+    require(!runtime.target_stats("missing.target").has_value(),
+            "unknown target has no observation snapshot");
 
     auto active = runtime.reserve_target("dialogue.primary");
     require(runtime.admit_reserved(std::move(active.reservation),
@@ -166,6 +170,7 @@ void test_registration_and_reservation_invariants() {
                 .admitted,
             "active message is admitted");
     gate.wait_until_entered();
+    clock.advance(250);
 
     auto queued = runtime.reserve_target("dialogue.primary");
     require(runtime.admit_reserved(std::move(queued.reservation),
@@ -175,19 +180,42 @@ void test_registration_and_reservation_invariants() {
     const auto full = runtime.reserve_target("dialogue.primary");
     require(full.error == cabinflow::runtime::Runtime::TargetReservationError::kQueueFull,
             "full target queue rejects without mutating ledger or evicting queued work");
+    const auto blocked_stats = runtime.target_stats("dialogue.primary");
+    require(blocked_stats.has_value() && blocked_stats->queue_depth == 1 &&
+                blocked_stats->queue_full_rejections == 1 &&
+                blocked_stats->handling_count == 0,
+            "slow target exposes queued depth and one rejected reservation");
+
+    auto final_message = make_message("retry-after-full", "dialogue.primary", 2);
+    final_message.envelope.is_final = true;
 
     gate.release();
     gate.wait_until_handled(2);
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        require(gate.message_ids ==
+                    std::vector<std::string>{"active-message", "queued-message"},
+                "queue-full rejection preserves the previously queued item");
+    }
 
     auto retry = runtime.reserve_target("dialogue.primary");
     require(static_cast<bool>(retry), "released reservation restores capacity");
-    auto final_message = make_message("retry-after-full", "dialogue.primary", 2);
-    final_message.envelope.is_final = true;
     const auto admitted = runtime.admit_reserved(std::move(retry.reservation),
-                                                  std::move(final_message), {});
+                                                  final_message, {});
     require(admitted.admitted, "final message rejected by full queue can retry safely");
     gate.wait_until_handled(3);
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        require(gate.message_ids.back() == "retry-after-full",
+                "same final message reaches the target after capacity frees");
+    }
     runtime.stop();
+    const auto completed_stats = runtime.target_stats("dialogue.primary");
+    require(completed_stats.has_value() && completed_stats->queue_depth == 0 &&
+                completed_stats->queue_full_rejections == 1 &&
+                completed_stats->handling_count == 3 &&
+                completed_stats->handling_duration_ns_total == 250,
+            "target snapshot counts completed handlers and injected-clock duration");
 }
 
 void test_worker_failure_and_deadline_rules() {
@@ -296,15 +324,90 @@ void test_target_workers_are_isolated() {
             "isolated targets start");
 
     auto slow = runtime.reserve_target("slow");
-    auto fast = runtime.reserve_target("fast");
     require(runtime.admit_reserved(std::move(slow.reservation),
-                                   make_message("slow", "slow", 0), {}).admitted &&
-                runtime.admit_reserved(std::move(fast.reservation),
-                                       make_message("fast", "fast", 0), {}).admitted,
-            "both target messages are admitted");
+                                   make_message("slow-active", "slow", 0), {}).admitted,
+            "slow target accepts its active message");
     slow_gate.wait_until_entered();
+
+    auto slow_queued = runtime.reserve_target("slow");
+    require(runtime.admit_reserved(std::move(slow_queued.reservation),
+                                   make_message("slow-queued", "slow", 1), {}).admitted,
+            "slow target queues one additional message");
+    require(runtime.reserve_target("slow").error ==
+                cabinflow::runtime::Runtime::TargetReservationError::kQueueFull,
+            "slow target is full");
+
+    auto fast = runtime.reserve_target("fast");
+    require(runtime.admit_reserved(std::move(fast.reservation),
+                                   make_message("fast", "fast", 0), {}).admitted,
+            "full slow queue does not block admission to fast target");
     fast_gate.wait_until_handled(1);
     slow_gate.release();
+    slow_gate.wait_until_handled(2);
+    runtime.stop();
+}
+
+void test_queued_cancellation(bool cancel_session) {
+    cabinflow::test::FakeClock clock(1'000'000);
+    cabinflow::transport::InMemoryTransport transport;
+    NullLogger logger;
+    cabinflow::runtime::Runtime runtime(transport, clock, logger);
+    Gate gate;
+    gate.block = true;
+    require(runtime.add_target_node(std::make_unique<ScriptedTarget>(
+                "cancel-target", gate,
+                cabinflow::runtime::MessageHandlingResult::kHandled), 1) ==
+                cabinflow::runtime::RuntimeError::kNone &&
+                runtime.start() == cabinflow::runtime::RuntimeError::kNone,
+            "cancellation target starts");
+
+    auto active = runtime.reserve_target("cancel-target");
+    require(runtime.admit_reserved(
+                std::move(active.reservation),
+                make_message("already-running", "cancel-target", 0), {}).admitted,
+            "first message begins before cancellation");
+    gate.wait_until_entered();
+
+    std::mutex failure_mutex;
+    std::condition_variable failure_changed;
+    std::vector<cabinflow::runtime::Runtime::TargetDeliveryFailure> failures;
+    auto queued = runtime.reserve_target("cancel-target");
+    require(runtime.admit_reserved(
+                std::move(queued.reservation),
+                make_message("not-started", "cancel-target", 1),
+                [&](cabinflow::runtime::Runtime::TargetDeliveryFailure failure) {
+                    std::lock_guard<std::mutex> lock(failure_mutex);
+                    failures.push_back(failure);
+                    failure_changed.notify_all();
+                }).admitted,
+            "second message waits in the target queue");
+
+    if (cancel_session) {
+        runtime.cancel_session("session");
+    } else {
+        runtime.cancel_work("session", "work");
+    }
+    gate.release();
+
+    {
+        std::unique_lock<std::mutex> lock(failure_mutex);
+        require(failure_changed.wait_for(lock, 1s, [&] {
+                    return failures.size() == 1;
+                }),
+                "queued cancellation reports a typed failure");
+        require(failures.front() ==
+                    (cancel_session
+                         ? cabinflow::runtime::Runtime::TargetDeliveryFailure::
+                               kSessionCancelled
+                         : cabinflow::runtime::Runtime::TargetDeliveryFailure::
+                               kWorkCancelled),
+                "cancellation scope is preserved for the queued message");
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        require(gate.message_ids == std::vector<std::string>{"already-running"},
+                "queued cancelled message never enters the target handler");
+    }
     runtime.stop();
 }
 
@@ -315,6 +418,8 @@ int main() {
         test_registration_and_reservation_invariants();
         test_worker_failure_and_deadline_rules();
         test_target_workers_are_isolated();
+        test_queued_cancellation(false);
+        test_queued_cancellation(true);
         std::cout << "target runtime contract test passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -12,6 +12,12 @@ namespace cabinflow::runtime {
 
 class CancellationRegistry;
 
+enum class CancellationReason {
+    kNone,
+    kSession,
+    kWork,
+};
+
 // A token is scoped to one session/work pair. It stays queryable if the
 // registry object is destroyed, because in-flight nodes may finish later.
 class CancellationToken final {
@@ -20,6 +26,7 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] bool cancelled() const noexcept;
+    [[nodiscard]] CancellationReason reason() const noexcept;
 
 private:
     CancellationToken(std::shared_ptr<detail::CancellationState> state,

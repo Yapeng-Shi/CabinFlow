@@ -113,6 +113,20 @@ int main() {
         return 1;
     }
 
+    // 失败回滚不能变成隐式重试；节点启动次数必须保持第一次尝试的记录。
+    if (!expect(failed_runtime.start() == RuntimeError::kLifecycleEnded,
+                "failed runtime cannot restart") ||
+        !expect(failed_events == std::vector<std::string>{
+                                    "first:start", "rejecting:start", "first:stop"},
+                "failed restart does not start nodes again")) {
+        return 1;
+    }
+    failed_runtime.stop();
+    failed_runtime.stop();
+    if (!expect(failed_events.size() == 3, "failed runtime stop is idempotent")) {
+        return 1;
+    }
+
     std::vector<std::string> events;
     Runtime runtime(transport, clock, logger);
     auto node = std::make_unique<RecordingNode>("worker", events,
@@ -122,6 +136,8 @@ int main() {
                 "node added") ||
         !expect(runtime.start() == RuntimeError::kNone, "runtime starts") ||
         !expect(runtime.running(), "runtime running") ||
+        !expect(runtime.start() == RuntimeError::kAlreadyStarted,
+                "running runtime rejects repeated start") ||
         !expect(node_ptr->token().valid(), "node receives work token") ||
         !expect(runtime.metric_value("runtime.node_started") == 1,
                 "node startup metric") ||
@@ -149,6 +165,27 @@ int main() {
                 "node shutdown metric") ||
         !expect(events == std::vector<std::string>{"worker:start", "worker:stop"},
                 "normal node lifecycle")) {
+        return 1;
+    }
+
+    runtime.stop();
+    if (!expect(runtime.start() == RuntimeError::kLifecycleEnded,
+                "stopped runtime cannot restart") ||
+        !expect(runtime.add_node(std::make_unique<RecordingNode>(
+                    "after-stop", events, RuntimeError::kNone)) ==
+                    RuntimeError::kLifecycleEnded,
+                "stopped runtime rejects registration") ||
+        !expect(runtime.metric_value("runtime.node_stopped") == 1,
+                "repeated stop does not stop node twice") ||
+        !expect(events == std::vector<std::string>{"worker:start", "worker:stop"},
+                "restart rejection has no lifecycle side effects")) {
+        return 1;
+    }
+
+    Runtime never_started(transport, clock, logger);
+    never_started.stop();
+    if (!expect(never_started.start() == RuntimeError::kLifecycleEnded,
+                "stop before start consumes the one-shot instance")) {
         return 1;
     }
 

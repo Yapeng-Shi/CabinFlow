@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+
+#include <cabinflow/protocol/message_envelope.hpp>
 
 namespace cabinflow::net {
 class EventLoop;
@@ -36,6 +39,12 @@ public:
     void stop();
 
     [[nodiscard]] std::uint16_t bound_port() const;
+
+    // 仅按已准入的最终输入消息身份回传；payload 对 Gateway 保持不透明。
+    // 调用方须先停止持有此 Gateway 回调的 Runtime worker，再销毁 Gateway。
+    [[nodiscard]] bool send_data_output(
+        const protocol::MessageEnvelope& request, std::string_view topic,
+        std::string payload);
 
 private:
     struct Impl;

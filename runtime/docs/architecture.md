@@ -36,14 +36,13 @@ concrete Agent nodes and their integration tests: neither `Runtime` nor
 
 ## Message and cancellation flow
 
+The in-process two-node demo uses `ITransport` directly. Its subscription
+callback performs Ledger admission before business processing; it is not the
+TCP Gateway's target queue path:
+
 ```text
-source node
-  -> MessageEnvelope + payload
-  -> ITransport.publish
-  -> transport routing
-  -> node handler
-  -> SessionLedger admission
-  -> business processing
+TextSourceNode -> ITransport.publish -> EchoProcessorNode subscription callback
+  -> SessionLedger admission -> echo processing
 ```
 
 For ZeroMQ the transport routing step has two frames: `topic` and a
@@ -57,6 +56,33 @@ TCP Framer -> RuntimeMessage decode -> Envelope validation
   -> target queue reservation -> SessionLedger admission -> queue commit
   -> TargetNode worker -> topic-specific payload decode
 ```
+
+The current typed Agent path is `cockpit.text.input -> dialogue.primary ->
+cockpit.text.output`. Gateway routes the final output to the TCP connection
+associated with that input's `(session_id, message_id)`; a work is not bound
+permanently to a connection. This rule-based path recognizes cockpit intents
+but does not execute vehicle controls or run ASR/LLM/TTS models.
+
+For the Week 2 fake voice experiment, the user approved preserving one work
+while internal messages cross `asr.primary`, `dialogue.primary`, `llm.fake`,
+and `tts.fake` TargetNodes. The CLI validates typed register/setup/exit
+commands through `ControlEnvelopeValidator` and `ControlService`, creates
+the work for `asr.primary`, and submits each typed data stage through Runtime
+reservation and Ledger admission.
+This is not a TCP audio ingress path or a real model pipeline. External first
+message validation against the work-owning Unit is approved but still pending implementation/verification;
+the in-process CLI does not prove that Gateway enforces it.
+
+Control requests use a separate admission path:
+
+```text
+TCP Framer -> ControlEnvelopeValidator -> ControlService -> UnitRegistry
+```
+
+`Setup` creates a server-side work ID without entering the data Ledger.
+Control TTL is checked before the service using the same monotonic clock domain
+as the client. A successful `Exit` explicitly cancels the work in Runtime
+before the success response is sent.
 
 `TargetNode` accepts only a generic `Message`. The target owns payload topic
 and Protobuf validation; `Runtime` owns each target's bounded queue and one
@@ -86,3 +112,12 @@ the exact lifecycle boundaries.
 Each registered `TargetNode` has one Runtime-owned worker and one bounded queue.
 Shutdown first stops admission, then discards queued work and joins workers,
 then stops nodes. This prevents a stopped target from receiving a new message.
+
+Runtime is one-shot: failed startup and stop are terminal, not restart points.
+Starting freezes registration, and Stopping closes admission under the lifecycle
+lock. Node callbacks and worker joins run outside that lock so worker queries
+cannot form a lock/join cycle. Concurrent external stop callers wait for the
+single cleanup owner; terminal state is published only after cleanup. Direct
+stop from a worker or lifecycle callback is still a pending decision, not an
+implemented asynchronous shutdown path. See ADR-009 and the migration closeout
+record for the tested boundary.

@@ -1,0 +1,5 @@
+db6f51551762e40e549166fe041ea3e45464370b595e9ad23f06478ec3794fbb  agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/encoder-epoch-99-avg-1.int8.onnx
+4b618d383af304cfae281dbf0a53e8bf442c2f0502256cd5694bd6567ebdd834  agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/decoder-epoch-99-avg-1.int8.onnx
+bdda356d6f9b8c2d7cee9ee0e26075fa537490f7fd06520be408d287073667b9  agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/joiner-epoch-99-avg-1.int8.onnx
+a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3  agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/tokens.txt
+bcae393dbc5611be5ffa4c7ae0841558978a5a4f484008cb9dff3a2cc97ebe01  agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/bpe.model

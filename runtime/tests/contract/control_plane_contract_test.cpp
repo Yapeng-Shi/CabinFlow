@@ -28,6 +28,8 @@ using cabinflow::protocol::Message;
 using cabinflow::protocol::MessageKind;
 using cabinflow::protocol::v1::ControlRequest;
 
+constexpr std::uint64_t kControlNowNs = 1'000'000'000ULL;
+
 void require(bool condition, std::string_view description) {
     if (!condition) {
         throw std::runtime_error(std::string(description));
@@ -45,6 +47,7 @@ Message make_request(std::string message_id, std::string session_id,
     message.envelope.target_node = "control-service";
     message.envelope.topic = "control.request";
     message.envelope.kind = MessageKind::kData;
+    message.envelope.created_monotonic_ns = kControlNowNs;
     message.envelope.ttl_ms = 1000;
     require(request.SerializeToString(&message.payload), "serialize control request");
     return message;
@@ -67,7 +70,8 @@ ControlRequest setup_request(std::string unit_id) {
 }
 
 void test_control_envelope_rules() {
-    ControlEnvelopeValidator validator;
+    cabinflow::test::FakeClock clock(kControlNowNs);
+    ControlEnvelopeValidator validator(clock);
 
     const auto setup = setup_request("asr.primary");
     const auto valid_setup = validator.validate(
@@ -105,6 +109,33 @@ void test_control_envelope_rules() {
                 malformed_result.should_close_connection,
             "malformed typed payload closes without a fallback parser");
 
+    auto before_deadline = make_request("setup-before-deadline", "session-1", "", setup);
+    before_deadline.envelope.created_monotonic_ns = 1;
+    require(static_cast<bool>(validator.validate(before_deadline)),
+            "control request remains valid just before its deadline");
+
+    auto expired = make_request("setup-expired", "session-1", "", setup);
+    expired.envelope.created_monotonic_ns = 0;
+    const auto expired_result = validator.validate(expired);
+    require(expired_result.error == ControlValidationError::kExpired &&
+                expired_result.can_return_error &&
+                !expired_result.should_close_connection,
+            "control request at its deadline returns a correlated error");
+
+    auto future = make_request("setup-future", "session-1", "", setup);
+    future.envelope.created_monotonic_ns = kControlNowNs + 1;
+    const auto future_result = validator.validate(future);
+    require(future_result.error == ControlValidationError::kInvalidEnvelope &&
+                future_result.can_return_error &&
+                !future_result.should_close_connection,
+            "future monotonic timestamp is an invalid control envelope");
+
+    auto zero_ttl = make_request("setup-zero-ttl", "session-1", "", setup);
+    zero_ttl.envelope.ttl_ms = 0;
+    require(validator.validate(zero_ttl).error ==
+                ControlValidationError::kInvalidEnvelope,
+            "control request requires a nonzero ttl");
+
     ControlRequest work_query;
     work_query.mutable_task_info()->set_scope(
         cabinflow::protocol::v1::TASK_INFO_SCOPE_WORK);
@@ -117,7 +148,8 @@ void test_control_envelope_rules() {
 
 void test_control_service_lifecycle_and_setup_idempotency() {
     cabinflow::runtime::UnitRegistry registry;
-    ControlEnvelopeValidator validator;
+    cabinflow::test::FakeClock clock(kControlNowNs);
+    ControlEnvelopeValidator validator(clock);
     ControlService service(registry);
 
     const auto invalid_registration = validator.validate(
@@ -159,6 +191,14 @@ void test_control_service_lifecycle_and_setup_idempotency() {
     require(repeated_response.response.has_setup() &&
                 repeated_response.response.setup().work().work_id() == work_id,
             "same setup identity returns original work id");
+
+    cabinflow::test::FakeClock late_clock(kControlNowNs + 1'000'000'000ULL);
+    ControlEnvelopeValidator late_validator(late_clock);
+    const auto expired_replay = late_validator.validate(
+        make_request("setup-1", "session-1", "", setup_request("asr.primary")));
+    require(expired_replay.error == ControlValidationError::kExpired &&
+                registry.find_session_work("session-1").size() == 1,
+            "expired replay is rejected before setup idempotency returns the work");
 
     const auto conflicting_setup = validator.validate(
         make_request("setup-1", "session-1", "", setup_request("tts.primary")));
@@ -221,7 +261,8 @@ void test_control_service_lifecycle_and_setup_idempotency() {
 }
 
 void test_response_identity_and_sequence_are_independent() {
-    ControlEnvelopeValidator validator;
+    cabinflow::test::FakeClock validation_clock(kControlNowNs);
+    ControlEnvelopeValidator validator(validation_clock);
     const auto setup = validator.validate(
         make_request("setup-request", "session-1", "", setup_request("asr.primary")));
     require(static_cast<bool>(setup), "setup response input validates");
@@ -321,7 +362,8 @@ void test_response_identity_and_sequence_are_independent() {
 
 void test_concurrent_setup_replay_and_response_sequences() {
     cabinflow::runtime::UnitRegistry registry;
-    ControlEnvelopeValidator validator;
+    cabinflow::test::FakeClock clock(kControlNowNs);
+    ControlEnvelopeValidator validator(clock);
     ControlService service(registry);
 
     const auto registration = validator.validate(

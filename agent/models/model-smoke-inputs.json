@@ -1,0 +1,32 @@
+{
+  "asr": {
+    "path": "agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/test_wavs/0.wav",
+    "sha256": "7d93384ca14702cc584a7a33fe2fed92e89e708549161cb12ea38c916882103b",
+    "sample_rate": 16000,
+    "channels": 1,
+    "sample_width": 2,
+    "frames": 160850,
+    "source": "Imported Edge_LLM_RAG_Voice test_wavs/0.wav, CabinFlow commit 10ab1382def232a478a902929916578e39d78c4e",
+    "acceptance": "Load the int8 model and decode non-empty text. No reference transcript or accuracy claim; source recording license remains unverified."
+  },
+  "llm": {
+    "prompt": "<|im_start|>user\n只输出一个数字：1+1等于多少？ /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "expected_text": "2",
+    "seed": 42,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0,
+    "presence_penalty": 1.5,
+    "max_tokens": 16,
+    "context_size": 512
+  },
+  "tts": {
+    "text": "你好，这是离线智能座舱语音测试。",
+    "speaker_id": 0,
+    "speed": 1,
+    "acceptance": "Decode a non-silent mono PCM16 WAV; intelligibility requires separate human listening, not a file-size check."
+  },
+  "threads": 2,
+  "revision": 2
+}

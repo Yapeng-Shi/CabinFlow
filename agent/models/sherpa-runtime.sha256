@@ -1,0 +1,5 @@
+23b06da6c8c2e672444a88d0d455c464551fb4c6577e99240502722909a4f9f6  sherpa-onnx-v1.11.3-linux-x64-shared/bin/sherpa-onnx
+9e075deb8adeb60352adfbb616b9989644cc1edc29828904a76abe14c8c8bdbe  sherpa-onnx-v1.11.3-linux-x64-shared/bin/sherpa-onnx-offline-tts
+cb3d244eb794c698cdd5bd1ebac41c57e9b4353b998aeb287b7f53e1799acf77  sherpa-onnx-v1.11.3-linux-x64-shared/lib/libonnxruntime.so
+5f9f0923e8a59cca0f868a080ae55f9cbae77ec9622b4c1e7d61762a1967ab5c  sherpa-onnx-v1.11.3-linux-x64-shared/lib/libsherpa-onnx-c-api.so
+14739f4117d7ba7671940db6d5e162d19bed262f1f7fd207dfc7c9bb8a5a0e39  sherpa-onnx-v1.11.3-linux-x64-shared/lib/libsherpa-onnx-cxx-api.so

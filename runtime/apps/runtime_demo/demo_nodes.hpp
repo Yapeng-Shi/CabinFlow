@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include <cabinflow/observability/logger.hpp>
+#include <cabinflow/protocol/message.hpp>
 #include <cabinflow/runtime/clock.hpp>
 #include <cabinflow/runtime/node.hpp>
 #include <cabinflow/runtime/node_context.hpp>
@@ -22,7 +23,7 @@ public:
         runtime::NodeContext& context) override;
     void stop() noexcept override;
 
-    [[nodiscard]] transport::TransportError publish(std::string_view text);
+    [[nodiscard]] transport::TransportError publish(protocol::Message message);
 
 private:
     runtime::NodeContext* context_{nullptr};

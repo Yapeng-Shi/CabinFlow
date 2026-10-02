@@ -45,7 +45,7 @@ void EchoProcessorNode::on_message(const protocol::Message& message) {
             {"echo_processor", "message_rejected", message.envelope.trace_id,
              message.envelope.session_id, message.envelope.work_id,
              message.envelope.message_id,
-             std::string(runtime::to_string(decision))});
+             {}, std::string(runtime::to_string(decision))});
         return;
     }
 
@@ -54,7 +54,7 @@ void EchoProcessorNode::on_message(const protocol::Message& message) {
     context_->logger().log(
         {"echo_processor", "echo_completed", message.envelope.trace_id,
          message.envelope.session_id, message.envelope.work_id,
-         message.envelope.message_id, "echo:" + message.payload});
+         message.envelope.message_id, "echo:" + message.payload, "handled"});
 }
 
 }  // namespace cabinflow::demo

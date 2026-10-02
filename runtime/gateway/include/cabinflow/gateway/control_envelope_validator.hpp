@@ -6,6 +6,10 @@
 
 #include <cabinflow/protocol/message.hpp>
 
+namespace cabinflow::runtime {
+class Clock;
+}
+
 namespace cabinflow::gateway {
 
 enum class ControlValidationError {
@@ -14,6 +18,7 @@ enum class ControlValidationError {
     kUnsupportedSchemaVersion,
     kInvalidEnvelope,
     kInvalidControlIdentity,
+    kExpired,
 };
 
 struct ValidatedControlRequest {
@@ -35,8 +40,13 @@ struct ControlValidationResult {
 // 只做控制面准入与唯一类型解码；不会把 setup 送入 SessionLedger。
 class ControlEnvelopeValidator final {
 public:
+    explicit ControlEnvelopeValidator(const runtime::Clock& clock) : clock_(clock) {}
+
     [[nodiscard]] ControlValidationResult validate(
         const protocol::Message& message) const;
+
+private:
+    const runtime::Clock& clock_;
 };
 
 }  // namespace cabinflow::gateway

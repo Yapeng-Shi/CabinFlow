@@ -14,6 +14,7 @@ enum class RuntimeError {
     kAlreadyStarted,
     kNodeStartFailure,
     kTargetWorkerStartFailure,
+    kLifecycleEnded,
 };
 
 [[nodiscard]] std::string_view to_string(RuntimeError error) noexcept;

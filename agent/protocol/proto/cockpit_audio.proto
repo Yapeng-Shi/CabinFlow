@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package cabinflow.agent.v1;
+
+// 首版离线输入固定为 16 kHz、单声道、16-bit PCM 的 WAV 容器。
+message AudioInput {
+  bytes wav_bytes = 1;
+}
+
+// ASR 与 TTS 之间的业务文本；链路身份始终由 Runtime Envelope 承载。
+message SpeechText {
+  string text = 1;
+  string request_message_id = 2;
+}
+
+message AudioOutput {
+  string request_message_id = 1;
+  bytes wav_bytes = 2;
+}

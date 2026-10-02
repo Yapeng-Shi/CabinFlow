@@ -3,6 +3,12 @@ target_link_libraries(runtime_build_sanity PRIVATE CabinFlow::Runtime)
 
 add_test(NAME runtime_build_sanity COMMAND runtime_build_sanity)
 
+add_test(NAME legacy_dependency_inventory_test
+    COMMAND ${CMAKE_COMMAND}
+        "-DRUNTIME_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/contract/legacy_dependency_inventory_test.cmake"
+)
+
 add_executable(event_loop_test unit/net/event_loop_test.cpp)
 target_link_libraries(event_loop_test PRIVATE CabinFlow::Net)
 
@@ -151,6 +157,18 @@ target_include_directories(runtime_test
 
 add_test(NAME runtime_test COMMAND runtime_test)
 
+add_executable(runtime_lifecycle_contract_test
+    contract/runtime_lifecycle_contract_test.cpp
+)
+target_link_libraries(runtime_lifecycle_contract_test
+    PRIVATE CabinFlow::Runtime CabinFlow::TransportInMemory
+)
+target_include_directories(runtime_lifecycle_contract_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support
+)
+add_test(NAME runtime_lifecycle_contract_test COMMAND runtime_lifecycle_contract_test)
+set_tests_properties(runtime_lifecycle_contract_test PROPERTIES TIMEOUT 30)
+
 add_executable(in_memory_transport_test unit/transport/in_memory_transport_test.cpp)
 target_link_libraries(in_memory_transport_test
     PRIVATE
@@ -197,10 +215,17 @@ target_link_libraries(zmq_transport_test
 
 add_test(NAME zmq_transport_test COMMAND zmq_transport_test)
 
-add_test(NAME runtime_demo_integration COMMAND runtime_demo)
-set_tests_properties(runtime_demo_integration PROPERTIES
-    PASS_REGULAR_EXPRESSION
-        "event=echo_completed.*trace_id=demo-trace.*session_id=driver-session.*work_id=demo-work.*message_id=demo-message.*detail=echo:hello_cabinflow"
+add_test(NAME runtime_demo_integration
+    COMMAND ${CMAKE_COMMAND}
+        "-DRUNTIME_DEMO=$<TARGET_FILE:runtime_demo>"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/runtime_demo_output.cmake"
+)
+
+add_test(NAME fake_voice_demo_integration
+    COMMAND ${CMAKE_COMMAND}
+        "-DFAKE_VOICE_DEMO=$<TARGET_FILE:fake_voice_demo>"
+        "-DFAKE_VOICE_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/fake-voice-test"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/fake_voice_demo_output.cmake"
 )
 
 # 压力程序不加入默认 all/CTest；它用于手动复现满队列下的并发不变量。

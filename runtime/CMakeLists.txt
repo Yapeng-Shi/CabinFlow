@@ -23,6 +23,8 @@ add_subdirectory(core)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../agent/dialogue
                  ${CMAKE_CURRENT_BINARY_DIR}/agent-dialogue)
 add_subdirectory(gateway)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../agent/apps/fake_voice_demo
+                 ${CMAKE_CURRENT_BINARY_DIR}/agent-fake-voice-demo)
 add_subdirectory(apps/runtime_demo)
 
 if(BUILD_TESTING)

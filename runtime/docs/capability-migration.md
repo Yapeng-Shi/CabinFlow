@@ -25,16 +25,16 @@
 | TCP 服务端与连接生命周期 | `TcpServer`、`TcpConnection`、`Acceptor` | `unit-manager/src/tcp_comm.cpp` | epoll、pthread | 迁移 | `net/` | legacy characterization；新 TcpConnection peer close/回调内关闭/响应，TcpServer 双连接、2 worker、停止释放，Debug/ASan/TSan | migrating |
 | TCP 客户端与连接器 | `TcpClient`、`Connector` | 历史 network API 使用方 | epoll、timerfd | 迁移；单次非阻塞连接，失败显式回调，不虚构旧代码未启用的 timer 重试 | `net/` | TcpClient 成功字节流、失败 `ECONNREFUSED`、连接回调内 stop；Debug/ASan/TSan | migrating |
 | EventLoop 线程与线程池 | `EventLoopThread`、`EventLoopThreadPool` | `TcpServer` | pthread | 迁移 | `net/` | worker 初始化、零 worker 使用 base loop、轮询分配、跨线程投递；Debug/ASan/TSan | migrating |
-| 旧依赖安装记录 | `runtime/build.sh` | 历史独立构建流程 | eventpp、simdjson、ZeroMQ | 保留为依赖迁移输入，不是当前构建入口 | `docs/` | 依赖清单与新 CMake 依赖对照 | pending |
+| 旧依赖安装记录 | `runtime/build.sh` | 历史独立构建流程 | eventpp、simdjson、ZeroMQ | 保留为依赖迁移输入，不是当前构建入口 | `docs/legacy-dependencies.md` | `legacy_dependency_inventory_test` 仅静态取证；缺失安装子脚本，安装行为仍未固定 | pending |
 | TCP 帧解析与断连语义 | `TcpSession::select_json_str`、`onMessage` | `unit-manager` TCP 接入 | JSON | 重做为 4 字节大端长度前缀加 `RuntimeMessage` Protobuf，不继承 JSON 字符串协议 | `gateway/` | Framer contract；`control_gateway_tcp_test`：分段帧、结构化 schema 错误后关闭、损坏 Protobuf 直接关闭 | migrating |
 | setup/pause/exit/taskinfo 控制命令 | `StackFlow::_rpc_*` 与虚函数 | 各历史业务单元 | pzmq、JSON、eventpp | 重做为类型化 Protobuf oneof 命令 | `protocol/control.proto`、`gateway/` | `control_plane_contract_test`：命令身份、scope、未知命令、reason、重复 setup、无效 work | migrating |
 | 节点注册与状态查询 | `sys_register_unit`、`sys_allocate_unit` | `StackFlow::setup`、remote server | pzmq、全局内存状态 | 重做，所有权归 Registry | `core/unit_registry.hpp` | `control_plane_contract_test`：注册、容量、状态转换、查询 | migrating |
 | work 生命周期结束 | `StackFlow::exit`、`sys_release_unit` | 历史业务单元 | pzmq | ControlService 负责命令，Registry 原子转换并释放容量 | `core/`、`gateway/` | `control_plane_contract_test`：pause、exit、exit 后拒绝后续命令 | migrating |
-| session/work 取消 | 历史 `exit` 仅释放单元，不具备独立取消语义 | 新 Runtime 节点 | 无 | 新建语义，保留为 Runtime Core | `core/cancellation.*`、`session_ledger.*` | `cancellation_flow_test` | migrating |
+| session/work 取消 | 历史 `exit` 仅释放单元，不具备独立取消语义 | 新 Runtime 节点 | 无 | 新建语义，保留为 Runtime Core；成功 `Exit` 同步取消对应 work | `core/cancellation.*`、`session_ledger.*`、`gateway/` | `cancellation_flow_test`；`target_runtime_contract_test` 的排队取消；`data_plane_gateway_tcp_test` 的 Exit 后准入 | migrating |
 | 消息准入、去重、顺序、final 状态 | 历史 ZMQ JSON 数据流无统一 admission gate | 新 Runtime 节点 | 无 | 新建语义，保留为 Runtime Core | `core/session_ledger.*` | core 单测、two-node flow | migrating |
 | 节点数据平面 PUB/SUB | `hybrid-comm/pzmq`、`llm_channel_obj` | `StackFlow`、`unit-manager` | ZeroMQ | 重做，屏蔽 ZeroMQ 头文件 | `transport/zmq/` | transport 单测、端到端 ZMQ 测试 | migrating |
-| TCP 到 Runtime 的消息桥接 | `TcpSession`、`zmq_bus_com`、`unit_action_match` | `unit-manager` | TCP、ZMQ、JSON | 控制面已重做为唯一 Gateway；数据面尚未接入 SessionLedger/queue/target node | `gateway/` | `control_gateway_tcp_test` 已覆盖 TCP 到 ControlService；数据面 MessageEnvelope 集成测试待建 | migrating |
-| 按 work_id 路由 | `llm_channel_obj`、`unit_data` | `StackFlow`、`zmq_bus` | ZeroMQ endpoint | 重做，优先 topic 与统一 Transport | `core/`、`transport/` | work 隔离、错误路由、取消后拒绝 | pending |
+| TCP 到 Runtime 的消息桥接 | `TcpSession`、`zmq_bus_com`、`unit_action_match` | `unit-manager` | TCP、ZMQ、JSON | 唯一 Protobuf Gateway；数据经目标队列预留、Ledger 准入、TargetNode；最终文本输出按输入消息 ID 回原连接 | `gateway/`、`core/`、`agent/dialogue/` | `control_gateway_tcp_test`、`data_plane_gateway_tcp_test`、`target_runtime_contract_test`；x86/WSL Debug 与相关 ASan | migrating |
+| 按 work_id 路由 | `llm_channel_obj`、`unit_data` | `StackFlow`、`zmq_bus` | ZeroMQ endpoint | 重做；Gateway 向 Registry 核验 work 存在及 session 归属，目标仍由明确的 `target_node` 指定 | `core/`、`gateway/`、`transport/` | `data_plane_gateway_tcp_test`：不存在或跨 session 的 work 被拒绝、Exit 后拒绝，连接保持 | migrating |
 | 控制命令、流式响应与 work_id 旧语义 | `node/test/src/main.cpp` | 历史测试节点 | StackFlow、pzmq | 保留为 characterization 输入 | `control/`、`gateway/`、`transport/` | 逐项转写为 contract test | pending |
 | TCP JSON、流式响应与 setup/exit/inference 协议 | `sample/test.py` | 历史 TCP 客户端 | TCP、JSON | 保留为 Gateway 与 control contract 输入 | `gateway/`、`control/` | frame/response contract test | pending |
 | TCP 多连接压力场景 | `sample/stress.py` | 历史 TCP 客户端 | TCP、Python threading | 保留为行为参考；共享计数竞态不作为性能指标 | `net/`、`gateway/` | 多连接正确性测试；独立基准工具 | pending |
@@ -61,9 +61,16 @@
 
 旧 `network/tests/` 不接入顶层构建，继续作为行为对照。它已经覆盖 Buffer 字节序、EventLoop 跨线程唤醒、EventLoopThreadPool worker 启动与轮询分配，以及 TcpServer 的分段/合并字节流、多连接、peer 主动断开、callback 内关闭和服务端停止释放。
 
-新 `CabinFlow::Net` 已迁移 `EventLoop / Channel / Poller`、内部 `Buffer / Socket / InetAddress / Acceptor / Connector / EventLoopThread / EventLoopThreadPool`，以及公开 `TcpConnection / TcpServer / TcpClient`。TcpServer 以 `set_worker_count()` 在启动前选择 worker 数；`stop()` 先拒绝新连接，等待各 worker 的 close 回调擦除连接，再 join worker。TcpClient 是单次非阻塞连接：成功后把 FD 所有权交给 TcpConnection，失败以 `std::error_code` 回调报告，不含隐藏重试。当前新 Runtime 在 WSL/x86 的 Debug 20/20、ASan 20/20 下通过，网络相关 TSan 8/8 通过；两 worker 的 TcpServer 场景额外重复 Debug 20 次和 TSan 10 次均通过。TSan 必须用 `setarch x86_64 -R` 避免初始化地址映射失败。旧测试的 TSan 只抑制 `google::LogMessageTime::CalcGmtOffset` 的第三方 glog 时区竞态；不抑制任何 `network` 报告。Gateway 已开始唯一 Protobuf 帧路径：`RuntimeMessageFramer` 以 4 字节大端长度前缀缓存 TCP 字节流，只在收齐完整帧时解码；长度与 Protobuf 错误进入终态，由未来 TCP 连接拥有者关闭。它尚未接入 TCP Server、ControlService 或 Runtime。
+新 `CabinFlow::Net` 已迁移 `EventLoop / Channel / Poller`、内部 `Buffer / Socket / InetAddress / Acceptor / Connector / EventLoopThread / EventLoopThreadPool`，以及公开 `TcpConnection / TcpServer / TcpClient`。TcpServer 以 `set_worker_count()` 在启动前选择 worker 数；`stop()` 先拒绝新连接，等待各 worker 的 close 回调擦除连接，再 join worker。TcpClient 是单次非阻塞连接：成功后把 FD 所有权交给 TcpConnection，失败以 `std::error_code` 回调报告，不含隐藏重试。网络底座先前在 WSL/x86 的 Debug 20/20、ASan 20/20 和网络相关 TSan 8/8 下通过；两 worker 的 TcpServer 场景额外重复 Debug 20 次和 TSan 10 次均通过。TSan 必须用 `setarch x86_64 -R` 避免初始化地址映射失败。旧测试的 TSan 只抑制 `google::LogMessageTime::CalcGmtOffset` 的第三方 glog 时区竞态；不抑制任何 `network` 报告。现在 Gateway 已连接 TcpServer、ControlService 和 Runtime：4 字节大端长度帧只承载 `RuntimeMessage` Protobuf；数据面按 target 预留有界队列，再经 SessionLedger 准入；排队消息若在 `Exit` 后尚未开始，worker 返回 `WORK_CANCELLED`，不调用业务节点。`cockpit.text.output` 是 Agent 的类型化结果，由 Gateway 按最终输入的 `message_id` 回原 TCP 连接；这条 x86/WSL 测试闭环不代表真实 ASR/LLM/TTS 或 RK3576 部署。
+
+仍未闭环：`Pause` 后的数据准入规则尚未确定；数据 Envelope 的 `target_node` 与 Registry 中 work 所属 `unit_id` 的一致性尚未作为独立规则验收。因此「按 work_id 路由」仍为 `migrating`，不能把当前测试说成完整的 work 状态鉴权。
 
 ## 当前明确禁止
+
+2026-10-02：已补旧依赖静态取证与一次性实例的外部同步生命周期修正，
+Debug/ASan 29/29、TSan 启停子集 2 项、生命周期重复与故障变体检查见
+[收尾记录](runtime-migration-closeout.md)。本轮未删除历史输入，未把这些检查
+替代控制/TCP/ZMQ 的逐能力验收；依赖安装仍 pending，迁移整体未完成。
 
 - 不提交或再次暂存任何尚未迁移能力的删除。
 - 不把 `net/`、`control/`、`gateway/` 创建为空目录占位。

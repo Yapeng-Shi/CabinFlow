@@ -5,3 +5,17 @@ package cabinflow.agent.v1;
 message TextInput {
   string text = 1;
 }
+
+enum CockpitIntent {
+  COCKPIT_INTENT_UNRECOGNIZED = 0;
+  COCKPIT_INTENT_CLIMATE_ON = 1;
+  COCKPIT_INTENT_CLIMATE_OFF = 2;
+  COCKPIT_INTENT_SEAT_HEATING_ON = 3;
+  COCKPIT_INTENT_SEAT_HEATING_OFF = 4;
+}
+
+message TextOutput {
+  string request_message_id = 1;
+  CockpitIntent intent = 2;
+  string text = 3;
+}

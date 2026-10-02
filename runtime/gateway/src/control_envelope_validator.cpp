@@ -1,9 +1,14 @@
 #include <cabinflow/gateway/control_envelope_validator.hpp>
 
+#include <cstdint>
 #include <utility>
+
+#include <cabinflow/runtime/clock.hpp>
 
 namespace cabinflow::gateway {
 namespace {
+
+constexpr std::uint64_t kNanosecondsPerMillisecond = 1'000'000;
 
 [[nodiscard]] bool has_response_identity(
     const protocol::MessageEnvelope& envelope) {
@@ -53,6 +58,19 @@ ControlValidationResult ControlEnvelopeValidator::validate(
         return make_error_result(message, std::move(command),
                                  ControlValidationError::kInvalidEnvelope, true,
                                  false);
+    }
+
+    const auto now_monotonic_ns = clock_.now_monotonic_ns();
+    if (now_monotonic_ns < envelope.created_monotonic_ns) {
+        return make_error_result(message, std::move(command),
+                                 ControlValidationError::kInvalidEnvelope, true,
+                                 false);
+    }
+    // 控制命令在产生副作用前使用同机单调时钟判过期，不进入数据面的 Ledger。
+    if (now_monotonic_ns - envelope.created_monotonic_ns >=
+        static_cast<std::uint64_t>(envelope.ttl_ms) * kNanosecondsPerMillisecond) {
+        return make_error_result(message, std::move(command),
+                                 ControlValidationError::kExpired, true, false);
     }
 
     switch (command.command_case()) {

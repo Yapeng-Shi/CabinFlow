@@ -1,6 +1,8 @@
 #include <cabinflow/gateway/control_gateway.hpp>
 
 #include <atomic>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -22,6 +24,8 @@
 #include <cabinflow/runtime/runtime.hpp>
 #include <cabinflow/runtime/unit_registry.hpp>
 
+#include "message_id.hpp"
+
 namespace cabinflow::gateway {
 namespace {
 
@@ -40,6 +44,11 @@ namespace {
             response_error->set_code(
                 static_cast<std::uint32_t>(ControlErrorCode::kInvalidEnvelope));
             response_error->set_message("invalid control envelope identity");
+            break;
+        case ControlValidationError::kExpired:
+            response_error->set_code(
+                static_cast<std::uint32_t>(ControlErrorCode::kDeadlineExceeded));
+            response_error->set_message("control request deadline exceeded");
             break;
         case ControlValidationError::kMalformedControlPayload:
         case ControlValidationError::kNone:
@@ -75,17 +84,51 @@ namespace {
     return protocol::v1::DELIVERY_ERROR_UNSPECIFIED;
 }
 
+[[nodiscard]] bool data_deadline_expired(
+    const protocol::MessageEnvelope& envelope,
+    const runtime::Clock& clock) noexcept {
+    constexpr std::uint64_t kNanosecondsPerMillisecond = 1'000'000;
+    const auto now = clock.now_monotonic_ns();
+    if (now < envelope.created_monotonic_ns) {
+        return false;
+    }
+    return now - envelope.created_monotonic_ns >=
+           static_cast<std::uint64_t>(envelope.ttl_ms) *
+               kNanosecondsPerMillisecond;
+}
+
 [[nodiscard]] protocol::v1::DeliveryErrorCode to_delivery_error_code(
     runtime::Runtime::TargetDeliveryFailure failure) {
     switch (failure) {
         case runtime::Runtime::TargetDeliveryFailure::kDeadlineExceeded:
             return protocol::v1::DELIVERY_ERROR_DEADLINE_EXCEEDED;
+        case runtime::Runtime::TargetDeliveryFailure::kSessionCancelled:
+            return protocol::v1::DELIVERY_ERROR_SESSION_CANCELLED;
+        case runtime::Runtime::TargetDeliveryFailure::kWorkCancelled:
+            return protocol::v1::DELIVERY_ERROR_WORK_CANCELLED;
         case runtime::Runtime::TargetDeliveryFailure::kUnsupportedTopic:
             return protocol::v1::DELIVERY_ERROR_UNSUPPORTED_TOPIC;
         case runtime::Runtime::TargetDeliveryFailure::kInvalidPayload:
             return protocol::v1::DELIVERY_ERROR_INVALID_PAYLOAD;
     }
     return protocol::v1::DELIVERY_ERROR_UNSPECIFIED;
+}
+
+[[nodiscard]] std::string_view to_delivery_error_detail(
+    runtime::Runtime::TargetDeliveryFailure failure) noexcept {
+    switch (failure) {
+        case runtime::Runtime::TargetDeliveryFailure::kDeadlineExceeded:
+            return "message deadline exceeded before handling";
+        case runtime::Runtime::TargetDeliveryFailure::kSessionCancelled:
+            return "session cancelled before handling";
+        case runtime::Runtime::TargetDeliveryFailure::kWorkCancelled:
+            return "work cancelled before handling";
+        case runtime::Runtime::TargetDeliveryFailure::kUnsupportedTopic:
+            return "target does not support this topic";
+        case runtime::Runtime::TargetDeliveryFailure::kInvalidPayload:
+            return "target rejected the payload";
+    }
+    return "unknown target delivery failure";
 }
 
 }  // namespace
@@ -138,13 +181,27 @@ struct ControlGateway::Impl {
         RuntimeMessageFramer framer;
     };
 
+    struct PendingOutputs {
+        struct Destination {
+            std::weak_ptr<net::TcpConnection> connection;
+            std::string connection_name;
+        };
+
+        std::mutex mutex;
+        std::map<std::pair<std::string, std::string>, Destination> destinations;
+    };
+
     Impl(net::EventLoop& loop_arg, std::string name, std::string listen_ip,
          std::uint16_t listen_port, runtime::UnitRegistry& registry,
          runtime::Runtime& runtime,
          const runtime::Clock& clock, std::uint32_t response_ttl_ms)
-        : runtime(runtime),
+        : registry(registry),
+          runtime(runtime),
+          clock(clock),
+          response_ttl_ms(response_ttl_ms),
           delivery_responder(std::make_shared<DeliveryErrorResponder>(
               clock, response_ttl_ms)),
+          validator(clock),
           service(registry),
           response_builder(clock, delivery_responder->sequencer, response_ttl_ms),
           server(loop_arg, std::move(name), std::move(listen_ip), listen_port) {
@@ -158,16 +215,91 @@ struct ControlGateway::Impl {
             });
     }
 
-    ~Impl() { delivery_responder->stop_accepting(); }
+    ~Impl() {
+        output_accepting.store(false);
+        delivery_responder->stop_accepting();
+    }
 
     void handle_connection(const net::TcpConnectionPtr& connection) {
-        std::lock_guard<std::mutex> lock(connections_mutex);
-        if (connection->connected()) {
-            connections.emplace(connection->name(), std::make_shared<ConnectionState>());
-            return;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            if (connection->connected()) {
+                connections.emplace(connection->name(),
+                                    std::make_shared<ConnectionState>());
+                return;
+            }
+            connections.erase(connection->name());
         }
-        // 连接关闭只释放协议缓存；不拥有 work，因此不触发 cancel 或 exit。
-        connections.erase(connection->name());
+        // 断连只移除该连接的输出去向，不拥有 work，也不触发 cancel 或 exit。
+        std::lock_guard<std::mutex> lock(pending_outputs->mutex);
+        for (auto it = pending_outputs->destinations.begin();
+             it != pending_outputs->destinations.end();) {
+            if (it->second.connection_name == connection->name()) {
+                it = pending_outputs->destinations.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    [[nodiscard]] bool send_data_output(
+        const protocol::MessageEnvelope& request, std::string_view topic,
+        std::string payload) {
+        if (!output_accepting.load() || !request.is_final ||
+            request.session_id.empty() || request.message_id.empty() ||
+            topic.empty() || response_ttl_ms == 0U) {
+            return false;
+        }
+
+        const auto key = std::make_pair(request.session_id, request.message_id);
+        std::lock_guard<std::mutex> lock(pending_outputs->mutex);
+        const auto found = pending_outputs->destinations.find(key);
+        if (found == pending_outputs->destinations.end()) {
+            return false;
+        }
+        const auto connection = found->second.connection.lock();
+        if (!connection || !connection->connected()) {
+            pending_outputs->destinations.erase(found);
+            return false;
+        }
+
+        const auto sequence = delivery_responder->sequencer.next(
+            request.session_id, request.work_id, topic, connection->name());
+        const auto message_id = generate_gateway_message_id("data-output-");
+        if (!sequence || message_id.empty()) {
+            pending_outputs->destinations.erase(found);
+            return false;
+        }
+
+        protocol::Message response;
+        auto& envelope = response.envelope;
+        envelope.schema_version = protocol::kCurrentSchemaVersion;
+        envelope.message_id = message_id;
+        envelope.trace_id = request.trace_id;
+        envelope.session_id = request.session_id;
+        envelope.work_id = request.work_id;
+        envelope.source_node = request.target_node;
+        envelope.target_node = request.source_node;
+        envelope.topic = std::string(topic);
+        envelope.kind = protocol::MessageKind::kData;
+        envelope.seat = request.seat;
+        envelope.sequence = sequence.sequence;
+        envelope.created_monotonic_ns = clock.now_monotonic_ns();
+        envelope.ttl_ms = response_ttl_ms;
+        envelope.is_final = true;
+        response.payload = std::move(payload);
+        const auto frame = RuntimeMessageFramer::encode(response);
+        pending_outputs->destinations.erase(found);
+        if (!frame) {
+            return false;
+        }
+        try {
+            // 序号分配与入发送队列共用同一锁，保持同一响应流的线上顺序。
+            connection->send(frame.bytes);
+        } catch (const std::logic_error&) {
+            return false;
+        }
+        return true;
     }
 
     [[nodiscard]] std::shared_ptr<ConnectionState> find_connection_state(
@@ -219,6 +351,11 @@ struct ControlGateway::Impl {
         }
 
         const auto service_result = service.handle(*validation.request);
+        if (service_result.response.has_exit()) {
+            // 先使 Ledger 和 worker 看见取消，再把 Exit 成功响应发给客户端。
+            runtime.cancel_work(validation.request->message.envelope.session_id,
+                                validation.request->message.envelope.work_id);
+        }
         const auto response = response_builder.build(*validation.request, service_result,
                                                      connection->name());
         send_response(connection, response, false);
@@ -239,6 +376,32 @@ struct ControlGateway::Impl {
             delivery_responder->send(connection, validation.request->message, code,
                                      "invalid data envelope",
                                      validation.should_close_connection);
+            return;
+        }
+
+        if (data_deadline_expired(validation.request->message.envelope, clock)) {
+            // 解码后先判断时效，再查找目标；已过期消息不消耗目标队列容量。
+            delivery_responder->send(
+                connection, validation.request->message,
+                protocol::v1::DELIVERY_ERROR_DEADLINE_EXCEEDED,
+                "data message deadline exceeded");
+            return;
+        }
+
+        const auto& envelope = validation.request->message.envelope;
+        const auto work = registry.find_work(envelope.session_id, envelope.work_id);
+        if (!work) {
+            delivery_responder->send(
+                connection, validation.request->message,
+                protocol::v1::DELIVERY_ERROR_WORK_NOT_FOUND,
+                "work does not exist in this session");
+            return;
+        }
+        if (work.work.state == runtime::WorkState::kExited) {
+            delivery_responder->send(
+                connection, validation.request->message,
+                protocol::v1::DELIVERY_ERROR_WORK_CANCELLED,
+                "work has exited");
             return;
         }
 
@@ -263,6 +426,23 @@ struct ControlGateway::Impl {
         }
 
         const protocol::Message request = validation.request->message;
+        const bool expects_output = request.envelope.is_final;
+        const auto output_key = std::make_pair(request.envelope.session_id,
+                                               request.envelope.message_id);
+        bool pending_inserted = false;
+        if (expects_output) {
+            std::lock_guard<std::mutex> lock(pending_outputs->mutex);
+            pending_inserted = pending_outputs->destinations.emplace(
+                output_key, PendingOutputs::Destination{connection,
+                                                        connection->name()}).second;
+        }
+        if (expects_output && !pending_inserted) {
+            delivery_responder->send(
+                connection, request,
+                protocol::v1::DELIVERY_ERROR_DUPLICATE_MESSAGE,
+                "final input message ID already has a pending destination");
+            return;
+        }
         const std::weak_ptr<net::TcpConnection> weak_connection = connection;
         const std::weak_ptr<DeliveryErrorResponder> weak_responder = delivery_responder;
         auto failure_handler = [weak_responder, weak_connection, request](
@@ -274,15 +454,25 @@ struct ControlGateway::Impl {
             }
             responder->send(
                 failed_connection, request, to_delivery_error_code(failure),
-                failure == runtime::Runtime::TargetDeliveryFailure::kDeadlineExceeded
-                    ? "message deadline exceeded before handling"
-                    : "target rejected data message");
+                to_delivery_error_detail(failure));
+        };
+
+        const std::weak_ptr<PendingOutputs> weak_pending = pending_outputs;
+        auto completion_handler = [weak_pending, output_key, pending_inserted] {
+            if (!pending_inserted) {
+                return;
+            }
+            if (const auto pending = weak_pending.lock()) {
+                std::lock_guard<std::mutex> lock(pending->mutex);
+                pending->destinations.erase(output_key);
+            }
         };
 
         const auto admission = runtime.admit_reserved(
             std::move(reservation.reservation), validation.request->message,
-            std::move(failure_handler));
+            std::move(failure_handler), completion_handler);
         if (!admission.admitted) {
+            completion_handler();
             delivery_responder->send(
                 connection, request, to_delivery_error_code(admission.delivery_result),
                 "data message rejected by session ledger");
@@ -319,7 +509,12 @@ struct ControlGateway::Impl {
 
     std::mutex connections_mutex;
     std::unordered_map<std::string, std::shared_ptr<ConnectionState>> connections;
+    runtime::UnitRegistry& registry;
     runtime::Runtime& runtime;
+    const runtime::Clock& clock;
+    std::uint32_t response_ttl_ms;
+    std::atomic<bool> output_accepting{true};
+    std::shared_ptr<PendingOutputs> pending_outputs{std::make_shared<PendingOutputs>()};
     std::shared_ptr<DeliveryErrorResponder> delivery_responder;
     ControlEnvelopeValidator validator;
     DataEnvelopeValidator data_validator;
@@ -345,17 +540,27 @@ void ControlGateway::set_worker_count(std::size_t worker_count) {
 }
 
 void ControlGateway::start() {
+    impl_->output_accepting.store(true);
     impl_->delivery_responder->start_accepting();
     impl_->server.start();
 }
 
 void ControlGateway::stop() {
+    impl_->output_accepting.store(false);
     impl_->delivery_responder->stop_accepting();
     impl_->server.stop();
+    std::lock_guard<std::mutex> lock(impl_->pending_outputs->mutex);
+    impl_->pending_outputs->destinations.clear();
 }
 
 std::uint16_t ControlGateway::bound_port() const {
     return impl_->server.bound_port();
+}
+
+bool ControlGateway::send_data_output(
+    const protocol::MessageEnvelope& request, std::string_view topic,
+    std::string payload) {
+    return impl_->send_data_output(request, topic, std::move(payload));
 }
 
 }  // namespace cabinflow::gateway

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include <cockpit_text.pb.h>
 
@@ -63,18 +64,47 @@ constexpr std::size_t kMaxTextBytes = 16U * 1024U;
     return true;
 }
 
+[[nodiscard]] std::pair<v1::CockpitIntent, std::string_view> recognize_intent(
+    std::string_view text) noexcept {
+    if (text == "打开空调") {
+        return {v1::COCKPIT_INTENT_CLIMATE_ON, "识别到打开空调意图，未执行车控。"};
+    }
+    if (text == "关闭空调") {
+        return {v1::COCKPIT_INTENT_CLIMATE_OFF, "识别到关闭空调意图，未执行车控。"};
+    }
+    if (text == "打开座椅加热" || text == "turn on seat heating") {
+        return {v1::COCKPIT_INTENT_SEAT_HEATING_ON,
+                "识别到打开座椅加热意图，未执行车控。"};
+    }
+    if (text == "关闭座椅加热") {
+        return {v1::COCKPIT_INTENT_SEAT_HEATING_OFF,
+                "识别到关闭座椅加热意图，未执行车控。"};
+    }
+    return {v1::COCKPIT_INTENT_UNRECOGNIZED,
+            "未识别到支持的座舱意图，未执行车控。"};
+}
+
 }  // namespace
+
+DialogueTextNode::DialogueTextNode(OutputHandler output_handler)
+    : output_handler_(std::move(output_handler)) {}
 
 std::string_view DialogueTextNode::name() const noexcept {
     return "dialogue.primary";
 }
 
 runtime::RuntimeError DialogueTextNode::start(runtime::NodeContext& context) {
+    if (!output_handler_) {
+        return runtime::RuntimeError::kNodeStartFailure;
+    }
     context_ = &context;
     return runtime::RuntimeError::kNone;
 }
 
-void DialogueTextNode::stop() noexcept { context_ = nullptr; }
+void DialogueTextNode::stop() noexcept {
+    buffered_inputs_.clear();
+    context_ = nullptr;
+}
 
 runtime::MessageHandlingResult DialogueTextNode::on_message(
     const protocol::Message& message) noexcept {
@@ -101,6 +131,33 @@ runtime::MessageHandlingResult DialogueTextNode::on_text_input(
         "dialogue", "text_input_received", envelope.trace_id, envelope.session_id,
         envelope.work_id, envelope.message_id,
         "text_bytes=" + std::to_string(text.size())});
+
+    const auto key = std::make_pair(envelope.session_id, envelope.work_id);
+    auto [found, inserted] = buffered_inputs_.try_emplace(key);
+    static_cast<void>(inserted);
+    if (found->second.size() + text.size() > kMaxTextBytes) {
+        buffered_inputs_.erase(found);
+        return runtime::MessageHandlingResult::kInvalidPayload;
+    }
+    found->second.append(text);
+    if (!envelope.is_final) {
+        return runtime::MessageHandlingResult::kHandled;
+    }
+
+    // 分片属于同一 work 的输入流；只在 final 到达时识别一次并回传原请求连接。
+    const auto [intent, reply] = recognize_intent(found->second);
+    buffered_inputs_.erase(found);
+    v1::TextOutput output;
+    output.set_request_message_id(envelope.message_id);
+    output.set_intent(intent);
+    output.set_text(std::string(reply));
+    std::string payload;
+    if (!output.SerializeToString(&payload) ||
+        !output_handler_(envelope, "cockpit.text.output", std::move(payload))) {
+        context_->logger().log(observability::Event{
+            "dialogue", "text_output_not_delivered", envelope.trace_id,
+            envelope.session_id, envelope.work_id, envelope.message_id, ""});
+    }
     return runtime::MessageHandlingResult::kHandled;
 }
 

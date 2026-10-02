@@ -12,6 +12,7 @@ struct Event {
     std::string work_id;
     std::string message_id;
     std::string detail;
+    std::string status{};
 };
 
 }  // namespace cabinflow::observability

@@ -20,6 +20,7 @@ enum class ControlErrorCode : std::uint32_t {
     kInternal = 7,
     kUnsupportedSchemaVersion = 8,
     kInvalidEnvelope = 9,
+    kDeadlineExceeded = 10,
 };
 
 struct ControlServiceResult {
