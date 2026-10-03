@@ -63,7 +63,11 @@
 
 新 `CabinFlow::Net` 已迁移 `EventLoop / Channel / Poller`、内部 `Buffer / Socket / InetAddress / Acceptor / Connector / EventLoopThread / EventLoopThreadPool`，以及公开 `TcpConnection / TcpServer / TcpClient`。TcpServer 以 `set_worker_count()` 在启动前选择 worker 数；`stop()` 先拒绝新连接，等待各 worker 的 close 回调擦除连接，再 join worker。TcpClient 是单次非阻塞连接：成功后把 FD 所有权交给 TcpConnection，失败以 `std::error_code` 回调报告，不含隐藏重试。网络底座先前在 WSL/x86 的 Debug 20/20、ASan 20/20 和网络相关 TSan 8/8 下通过；两 worker 的 TcpServer 场景额外重复 Debug 20 次和 TSan 10 次均通过。TSan 必须用 `setarch x86_64 -R` 避免初始化地址映射失败。旧测试的 TSan 只抑制 `google::LogMessageTime::CalcGmtOffset` 的第三方 glog 时区竞态；不抑制任何 `network` 报告。现在 Gateway 已连接 TcpServer、ControlService 和 Runtime：4 字节大端长度帧只承载 `RuntimeMessage` Protobuf；数据面按 target 预留有界队列，再经 SessionLedger 准入；排队消息若在 `Exit` 后尚未开始，worker 返回 `WORK_CANCELLED`，不调用业务节点。`cockpit.text.output` 是 Agent 的类型化结果，由 Gateway 按最终输入的 `message_id` 回原 TCP 连接；这条 x86/WSL 测试闭环不代表真实 ASR/LLM/TTS 或 RK3576 部署。
 
-仍未闭环：`Pause` 后的数据准入规则尚未确定；数据 Envelope 的 `target_node` 与 Registry 中 work 所属 `unit_id` 的一致性尚未作为独立规则验收。因此「按 work_id 路由」仍为 `migrating`，不能把当前测试说成完整的 work 状态鉴权。
+本轮已验证所有外部 TCP 数据 `target_node == work.unit_id`，拒绝不污染 Ledger；同 work
+内部跨 Target 仍允许。真实 Agent 的 TCP/Qt 根完成路径也已加入测试，详见
+[集成记录](../../agent/docs/voice-demo-integration.md)。`Pause` 后的数据准入规则和旧能力
+逐项验收仍未闭环，因此「按 work_id 路由」保留 `migrating`，不升级为完整状态鉴权或
+删除许可。Agent 的模型 server/信号装配也不等于正式 `runtime_daemon` 已完成。
 
 ## 当前明确禁止
 

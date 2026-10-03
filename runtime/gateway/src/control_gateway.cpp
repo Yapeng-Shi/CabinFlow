@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -28,6 +29,17 @@
 
 namespace cabinflow::gateway {
 namespace {
+
+constexpr std::string_view kDataOutputIdPrefix = "data-output-";
+
+struct TaskReservationGuard {
+    const DataTaskHooks* hooks{nullptr};
+    const protocol::Message* request{nullptr};
+    ~TaskReservationGuard() {
+        if (hooks) hooks->rollback(*request);
+    }
+    void committed() noexcept { hooks = nullptr; }
+};
 
 [[nodiscard]] ControlServiceResult make_validation_error(
     ControlValidationError error) {
@@ -244,10 +256,11 @@ struct ControlGateway::Impl {
 
     [[nodiscard]] bool send_data_output(
         const protocol::MessageEnvelope& request, std::string_view topic,
-        std::string payload) {
-        if (!output_accepting.load() || !request.is_final ||
+        std::string payload, protocol::MessageKind kind) {
+        if (!output_accepting.load() ||
             request.session_id.empty() || request.message_id.empty() ||
-            topic.empty() || response_ttl_ms == 0U) {
+            topic.empty() || response_ttl_ms == 0U ||
+            (kind != protocol::MessageKind::kData && kind != protocol::MessageKind::kError)) {
             return false;
         }
 
@@ -265,7 +278,7 @@ struct ControlGateway::Impl {
 
         const auto sequence = delivery_responder->sequencer.next(
             request.session_id, request.work_id, topic, connection->name());
-        const auto message_id = generate_gateway_message_id("data-output-");
+        const auto message_id = generate_gateway_message_id(kDataOutputIdPrefix);
         if (!sequence || message_id.empty()) {
             pending_outputs->destinations.erase(found);
             return false;
@@ -281,7 +294,7 @@ struct ControlGateway::Impl {
         envelope.source_node = request.target_node;
         envelope.target_node = request.source_node;
         envelope.topic = std::string(topic);
-        envelope.kind = protocol::MessageKind::kData;
+        envelope.kind = kind;
         envelope.seat = request.seat;
         envelope.sequence = sequence.sequence;
         envelope.created_monotonic_ns = clock.now_monotonic_ns();
@@ -350,6 +363,15 @@ struct ControlGateway::Impl {
             return;
         }
 
+        const auto exit_work = validation.request->command.has_exit()
+            ? registry.find_work(message.envelope.session_id, message.envelope.work_id)
+            : runtime::WorkResult{runtime::UnitRegistryError::kWorkNotFound, {}};
+        if (task_hooks.cancel && validation.request->command.has_exit() &&
+            !validation.request->command.exit().reason().empty() && exit_work &&
+            exit_work.work.state != runtime::WorkState::kExited) {
+            // 取消与 Agent 的终态提交先在同一锁线性化，不能只在 Registry 写 exited 后再通知。
+            task_hooks.cancel(message.envelope);
+        }
         const auto service_result = service.handle(*validation.request);
         if (service_result.response.has_exit()) {
             // 先使 Ledger 和 worker 看见取消，再把 Exit 成功响应发给客户端。
@@ -405,6 +427,15 @@ struct ControlGateway::Impl {
             return;
         }
 
+        if (envelope.target_node != work.work.unit_id) {
+            // 只限制外部入口；内部 Runtime 投递仍可沿同一 work 跨 Target。
+            delivery_responder->send(
+                connection, validation.request->message,
+                protocol::v1::DELIVERY_ERROR_INVALID_ENVELOPE,
+                "target_node does not match work unit_id");
+            return;
+        }
+
         auto reservation = runtime.reserve_target(
             validation.request->message.envelope.target_node);
         if (!reservation) {
@@ -426,7 +457,20 @@ struct ControlGateway::Impl {
         }
 
         const protocol::Message request = validation.request->message;
-        const bool expects_output = request.envelope.is_final;
+        TaskReservationGuard task_slot;
+        if (task_hooks.try_reserve) {
+            if (!task_hooks.try_reserve(request)) {
+                delivery_responder->send(connection, request,
+                    protocol::v1::DELIVERY_ERROR_QUEUE_FULL,
+                    "application task slot is busy or admission is closed");
+                return;
+            }
+            task_slot.hooks = &task_hooks;
+            task_slot.request = &request;
+        }
+        const bool managed_task = static_cast<bool>(task_hooks.complete);
+        // 非法 final 也需要在业务结束并清理后得到唯一失败终态；普通分片仍无输出去向。
+        const bool expects_output = managed_task || request.envelope.is_final;
         const auto output_key = std::make_pair(request.envelope.session_id,
                                                request.envelope.message_id);
         bool pending_inserted = false;
@@ -445,8 +489,16 @@ struct ControlGateway::Impl {
         }
         const std::weak_ptr<net::TcpConnection> weak_connection = connection;
         const std::weak_ptr<DeliveryErrorResponder> weak_responder = delivery_responder;
-        auto failure_handler = [weak_responder, weak_connection, request](
+        const auto task_failure = std::make_shared<
+            std::optional<runtime::Runtime::TargetDeliveryFailure>>();
+        auto failure_handler = [weak_responder, weak_connection, request,
+                                managed_task, task_failure](
                                    runtime::Runtime::TargetDeliveryFailure failure) {
+            if (managed_task) {
+                // 同一 worker 先记录 failure，再执行 completion；业务终态只发送一次。
+                *task_failure = failure;
+                return;
+            }
             const auto responder = weak_responder.lock();
             const auto failed_connection = weak_connection.lock();
             if (!responder || !failed_connection) {
@@ -458,7 +510,7 @@ struct ControlGateway::Impl {
         };
 
         const std::weak_ptr<PendingOutputs> weak_pending = pending_outputs;
-        auto completion_handler = [weak_pending, output_key, pending_inserted] {
+        auto erase_pending = [weak_pending, output_key, pending_inserted] {
             if (!pending_inserted) {
                 return;
             }
@@ -468,14 +520,26 @@ struct ControlGateway::Impl {
             }
         };
 
+        auto completion_handler = [this, request, managed_task, task_failure, erase_pending] {
+            if (managed_task) {
+                const auto output = task_hooks.complete(request, *task_failure);
+                static_cast<void>(send_data_output(request.envelope, output.topic,
+                                                  output.payload, output.kind));
+            }
+            erase_pending();
+        };
+
         const auto admission = runtime.admit_reserved(
             std::move(reservation.reservation), validation.request->message,
             std::move(failure_handler), completion_handler);
         if (!admission.admitted) {
-            completion_handler();
+            // 未进入 Runtime 的请求只撤销占位，不能冒充 handler 已经完成。
+            erase_pending();
             delivery_responder->send(
                 connection, request, to_delivery_error_code(admission.delivery_result),
                 "data message rejected by session ledger");
+        } else {
+            task_slot.committed();
         }
     }
 
@@ -519,6 +583,8 @@ struct ControlGateway::Impl {
     ControlEnvelopeValidator validator;
     DataEnvelopeValidator data_validator;
     ControlService service;
+    DataTaskHooks task_hooks;
+    bool started{false};
     ControlResponseBuilder response_builder;
     net::TcpServer server;
 };
@@ -539,7 +605,16 @@ void ControlGateway::set_worker_count(std::size_t worker_count) {
     impl_->server.set_worker_count(worker_count);
 }
 
+void ControlGateway::set_data_task_hooks(DataTaskHooks hooks) {
+    if (impl_->started || !hooks.try_reserve || !hooks.rollback ||
+        !hooks.complete || !hooks.cancel) {
+        throw std::invalid_argument("complete data task hooks must be configured before start");
+    }
+    impl_->task_hooks = std::move(hooks);
+}
+
 void ControlGateway::start() {
+    impl_->started = true;
     impl_->output_accepting.store(true);
     impl_->delivery_responder->start_accepting();
     impl_->server.start();
@@ -559,8 +634,26 @@ std::uint16_t ControlGateway::bound_port() const {
 
 bool ControlGateway::send_data_output(
     const protocol::MessageEnvelope& request, std::string_view topic,
-    std::string payload) {
-    return impl_->send_data_output(request, topic, std::move(payload));
+    std::string payload, protocol::MessageKind kind) {
+    return impl_->send_data_output(request, topic, std::move(payload), kind);
+}
+
+bool ControlGateway::data_output_fits(
+    const protocol::MessageEnvelope& request, const DataTaskOutput& output) {
+    protocol::Message response;
+    response.envelope = request;
+    auto& envelope = response.envelope;
+    envelope.message_id = std::string(kDataOutputIdPrefix) + std::string(32, '0');
+    envelope.source_node = request.target_node;
+    envelope.target_node = request.source_node;
+    envelope.topic = output.topic;
+    envelope.kind = output.kind;
+    envelope.sequence = std::numeric_limits<std::uint64_t>::max();
+    envelope.created_monotonic_ns = std::numeric_limits<std::uint64_t>::max();
+    envelope.ttl_ms = std::numeric_limits<std::uint32_t>::max();
+    envelope.is_final = true;
+    response.payload = output.payload;
+    return static_cast<bool>(RuntimeMessageFramer::encode(response));
 }
 
 }  // namespace cabinflow::gateway

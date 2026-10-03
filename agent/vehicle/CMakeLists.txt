@@ -1,0 +1,5 @@
+add_library(cabinflow_fake_vehicle src/fake_vehicle.cpp)
+add_library(CabinFlow::FakeVehicle ALIAS cabinflow_fake_vehicle)
+target_include_directories(cabinflow_fake_vehicle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(cabinflow_fake_vehicle PUBLIC cxx_std_17)
+cabinflow_enable_compiler_warnings(cabinflow_fake_vehicle)

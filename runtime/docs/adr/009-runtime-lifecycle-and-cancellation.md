@@ -56,6 +56,12 @@ transport, ledger, and logger dependencies independently.
   Gateway 校验并执行类型化 `Exit`；`ControlService` 成功转换 Registry 状态后，
   Gateway 在发送成功响应前显式调用 `Runtime::cancel_work()`。后续输入由 Ledger
   拒绝，排队但未开始的消息由 worker 跳过；正在执行的 handler 仍需协作停止。
+- 当前单轮 Agent 先通过不透明 cancel hook 在应用锁上与候选结果提交线性化，再由
+  ControlService 处理有效 Exit；它不把 ExitResponse 当作 handler 已退出。
+  根 completion 等所有下游返回后清理并发布唯一业务终态。
+- 等待下游 Runtime 队列的同步根任务必须先由应用关闭准入、取消并 drain，再调用
+  `Runtime::stop()`。否则 stop 丢弃下游队列而根仍在等 completion，会造成 join 死锁。
+  这不是新的 Runtime stop API；server sigwait 外部线程和 Pipeline 测试覆盖当前装配。
 - A node that starts asynchronous work must make `stop()` wait for, cancel, or
   otherwise make its own callbacks safe before returning. Runtime provides
   ordering, not a generic solution for arbitrary business-thread ownership.

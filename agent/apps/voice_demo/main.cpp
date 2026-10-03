@@ -36,14 +36,23 @@ int main(int argc, char** argv) {
         cabinflow::agent::VoicePipeline pipeline(
             std::make_unique<cabinflow::agent::inference::SherpaAsrBackend>(argv[4]),
             std::make_unique<cabinflow::agent::inference::LlamaBackend>(argv[5], 2, 2048, 128),
-            std::make_unique<cabinflow::agent::inference::SherpaTtsBackend>(argv[6]));
+            std::make_unique<cabinflow::agent::inference::SherpaTtsBackend>(argv[6]),
+            std::make_unique<cabinflow::agent::FakeVehicle>(false, false));  // 明确以空调关、左前车窗关启动。
         const auto result = wav_mode ? pipeline.run_wav({std::move(input)}) : pipeline.run_text(std::move(input));
+        // 与 TCP 相同的根 completion 已清理 work；外部控制线程此时才停止 Runtime。
+        pipeline.shutdown();
         std::ofstream report(output / "result.txt");
         report << "status=" << static_cast<int>(result.status) << "\ntrace_id=" << result.trace_id
                << "\nsession_id=" << result.session_id << "\nwork_id=" << result.work_id
                << "\nrequest_message_id=" << result.request_message_id << "\ntranscript=" << result.transcript
                << "\nanswer=" << result.answer << "\nerror=" << result.detail
                << "\nsemantic_quality=not_automatically_verified\nhuman_listening=not_verified\n";
+        if (result.vehicle) {
+            report << "vehicle_simulated=" << result.vehicle->simulated
+                   << "\nclimate_on=" << result.vehicle->climate_on
+                   << "\naction_applied=" << result.vehicle->action_applied
+                   << "\nleft_front_window_open=" << result.vehicle->left_front_window_open << '\n';
+        } else report << "vehicle_state=unknown\n";
         report.close();
         if (!report) throw std::runtime_error("cannot write result report");
         if (result.status != cabinflow::agent::VoiceStatus::kCompleted) {

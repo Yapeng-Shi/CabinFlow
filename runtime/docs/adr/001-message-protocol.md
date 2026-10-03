@@ -29,7 +29,7 @@ TCP 只接收 4 字节大端长度前缀加 `RuntimeMessage` Protobuf，帧体�
 | `work_id` | `ControlService/UnitRegistry` 在 `Setup` 成功时生成并返回；后续由客户端携带 | `Setup` 前为空；数据面必须非空，Gateway 核验其存在且属于该 session。成功 `Exit` 后不再准入该 work；Registry 保留已退出记录，ID 不复用。 |
 | `message_id` | 客户端为每条入站消息提供；Gateway 为每条出站消息生成新 ID | 一条消息的身份，不等于 trace 或 work。`SessionLedger` 在本进程内对数据消息全局去重；重复 `Setup` 由 `(session_id, message_id)` 幂等键处理。Ledger 目前不淘汰已观察 ID，重启后内存状态消失。 |
 | `sequence` | 客户端为入站流分配；Gateway 为每个响应流独立分配 | 输入在同一 `(session_id, work_id, topic)` 内严格递增，首值不强制为 0；响应流从 0 开始，不能回显请求序号。进程重启后响应序号可重新从 0 开始。 |
-| `source_node` / `target_node` | 请求发送方填写；Gateway 响应交换方向 | 非空；数据的 target 由 Runtime 按唯一节点名查找。`target_node` 与 work 所属 `unit_id` 是否必须相等尚未验收。 |
+| `source_node` / `target_node` | 请求发送方填写；Gateway 响应交换方向 | 非空；所有外部 TCP 数据必须 `target_node == work.unit_id`，之后按唯一节点名查找；同 work 内部跨 Target 允许。 |
 | `topic` / `kind` / `is_final` | 发送方按唯一协议填写；Gateway 生成响应值 | topic 决定 payload 类型；`is_final` 只关闭进入 Ledger 的业务输入流，不能拿控制响应的 final 推断 work 已退出。 |
 | `seat` | 客户端填写；Gateway 数据输出回显 | 区域元数据，当前不构成区域权限校验。 |
 | `created_monotonic_ns` / `ttl_ms` | 请求发送方填写；Gateway 为响应生成创建时间和明确 TTL | 首版限定 TCP 客户端与 Gateway 共用同一主机的单调时钟域。控制请求在进入 `ControlService` 前、数据消息在准入/执行边界按 `now - created >= ttl_ms` 判过期；零 TTL、未来时间戳和过期均显式拒绝。跨主机单调时钟不可直接比较。 |
@@ -65,9 +65,24 @@ Ledger 的流状态；`Pause` 后数据准入规则尚未确定。
 | `Setup` 空 work、命令身份、控制响应关联 | 控制面处理，不放宽数据 Ledger 的非空 work 规则 | `control_plane_contract_test`、`control_gateway_tcp_test`。 |
 | TCP 半包/粘包、损坏帧、数据错误 | 完整帧才解码；不可关联则断连，可关联则类型化错误 | `gateway_framer_contract_test`、`data_plane_gateway_tcp_test`。 |
 | 控制请求恰好到期、未到期与未来时间戳 | 过期和未来时间戳返回关联错误；过期 `Setup` 不创建 work，连接可继续使用 | `control_plane_contract_test`、`control_gateway_tcp_test`。 |
+| 外部目标与 work 所属 Unit 不一致 | 准入前拒绝、不消费 ID/final；修正 target 后可准入，内部跨 Target 不受此限制 | `data_plane_gateway_tcp_test`。 |
+
+## 单轮 Agent 应用的已确认合同
+
+这些是 `agent/apps/voice_demo/` 的合同，不收紧通用 Runtime 的 partial 消息能力：
+
+- 每个 work 一条完整 final 输入；非法业务 payload/final 结束 work，重试必须新 Setup。
+- 根与下游 handler 实际返回后，根 completion 清理并生成一次 `cockpit.task.result`。
+  `VoiceTaskResult` 位于 AgentProtocol：显式输入 message ID、转写、回答、audio/failed/cancelled
+  oneof；成功 DATA，失败和取消 ERROR。cancelled 不是 wire CANCEL 入口。
+- Gateway 的输出类型保持不透明，pending 关联活到根 completion；未准入的错误才用
+  DeliveryError，已准入的错误交给应用构造唯一最终结果。
+- ExitResponse 是逻辑状态，不是 SDK 清理证明；前端等待业务终态解除 busy。
+  Setup 中取消没有数据 handler，只发 Exit 进行控制清理。
+- 本合同验证见 Agent 的 Pipeline/TCP/Qt tests 与 [集成记录](../../../agent/docs/voice-demo-integration.md)。
 
 ## 尚未完成的边界
 
-跨主机时间域方案、`Pause` 数据规则，及
-`target_node` 与 `unit_id` 一致性仍需明确决策和测试；不能用已有数据面测试
-推断这些行为已实现。
+跨主机时间域方案和 `Pause` 数据规则仍后置；不能用已有测试推断这些行为已实现。
+身份字段目前没有长度上限，极长输入身份重复进入结果可能令最小错误帧也超限；
+已询问各外部身份/topic 字段最多 256 UTF-8 字节的规则，尚未批准实施。

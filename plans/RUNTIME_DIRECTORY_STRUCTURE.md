@@ -11,6 +11,7 @@
 - 只补 Demo 必需的 Agent 应用装配，不调整现有 Runtime 目录，不预先定义大量新文件/target。
 - 2026-10-02 同日补充批准：系统集成/组件解耦优先，模型质量不再卡住装配。Agent 模型端口和具体适配器分离，启动时构造注入；不建设插件/工厂注册或自动回退。
 - Runtime 原构建入口不变。真实产品的显式装配入口位于 `agent/apps/voice_demo/`，用独立 build 目录复用 Runtime targets，并私有链接模型适配器；默认 Runtime 构建不要求模型 SDK。这是应用装配，不是第二个 Runtime 实现。
+- 当前已装配 `voice_demo_server` 与 `frontend/` 的 Qt/QML 客户端，复用同一 VoicePipeline；最终任务 schema 位于 AgentProtocol。窗口/TCP/播放状态已验证，人工听验与完整 Demo 仍见实施计划边界。
 - 正式 `runtime_daemon`、全量旧样例迁移、插件、重启、异步 stop、跨平台 IPC 和长期资源治理后置；这些项目不使用、不标完成，也不作为短时单任务 Demo 的总门槛。
 - 旧能力与源码仍受第 6 节删除门槛约束；冻结扩展和调整投入不授权删除。
 
@@ -250,7 +251,7 @@ runtime/
 - 数据面：Envelope/work 校验 → 目标队列预留 → Ledger 准入 → worker/TargetNode；队列满不消耗消息 ID、序号或 final 状态。
 - 类型化控制响应和 `runtime.delivery.error`；输出按输入身份关联回原 TCP 连接，断连不自动取消 work。
 
-Gateway 不链接 AgentProtocol，也不解析业务 payload。本轮只按实施计划解决 Demo 实际使用的非法业务 final 校验/提交边界，以及到最终结果的关联存活期；通用异步输出和 Pause 数据规则后置，不在首版使用，也不能从当前同步文本测试推断这些能力已完成。
+Gateway 不链接 AgentProtocol，也不解析业务 payload。当前 Demo 用不透明 DataTaskHooks 交接单任务槽位和根 completion 结果；非法业务 final/payload 由 Agent 终结 work，输出关联保留到实际根清理。所有外部数据验证 target 与 work 所属 unit 一致，内部跨 Target 不受限制。通用异步输出和 Pause 数据规则后置，不在首版使用，不能从当前测试推断这些能力已完成。
 
 ### `observability/`
 
@@ -275,6 +276,15 @@ Gateway 不链接 AgentProtocol，也不解析业务 payload。本轮只按实�
 `main.cpp` 不实现队列、协议或业务算法。`runtime_demo` 验证通用双节点语义；`agent/apps/fake_voice_demo/` 验证业务消息链，两者职责不同。前者不承接真实语音，后者不承接模型失败回退。
 
 新的真实语音 Demo 后端及 Qt/QML 前端装配属于 Agent 应用；它们只消费公开 Runtime/Gateway 接口。Qt 依赖留在前端，模型依赖留在 Agent 节点，Runtime 核心不依赖 Qt、音频播放或 FakeVehicle。先做能运行的最小装配，不为 Demo 额外建设正式 daemon、配置中心或应用管理框架；Runtime daemon 仍是账本后置项。
+
+步骤 5 的最小模拟模块位于 `agent/vehicle/`，由 `VoicePipeline` 显式持有并在应用启动时
+注入初始关状态；没有另建 Vehicle worker、Transport 或 Registry。执行回执属于
+`agent/protocol/proto/cockpit_task.proto`，Gateway 仍只转交不透明 payload，Runtime 不新增
+车辆协议或依赖。取消/动作提交使用应用已有任务锁，不扩展通用 Runtime。
+
+2026-10-03 获准的 2.5D 座舱视角与左前车窗开关仍在此边界内：状态属于
+`agent/vehicle/`，字段属于 AgentProtocol，场景为既有前端内的 `CockpitScene.qml`。
+不增加 Runtime 车辆节点、3D 引擎、CAN/VHAL 或另一条控制路径。
 
 ### `tests/`
 

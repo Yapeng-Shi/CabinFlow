@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -133,6 +134,22 @@ private:
     std::thread thread_;
 };
 
+class OtherTarget final : public cabinflow::runtime::TargetNode {
+public:
+    explicit OtherTarget(std::atomic<int>& calls) : calls_(calls) {}
+    std::string_view name() const noexcept override { return "other.primary"; }
+    cabinflow::runtime::RuntimeError start(cabinflow::runtime::NodeContext&) override {
+        return cabinflow::runtime::RuntimeError::kNone;
+    }
+    void stop() noexcept override {}
+    cabinflow::runtime::MessageHandlingResult on_message(const Message&) noexcept override {
+        ++calls_;
+        return cabinflow::runtime::MessageHandlingResult::kHandled;
+    }
+private:
+    std::atomic<int>& calls_;
+};
+
 class GatewayFixture final {
 public:
     GatewayFixture()
@@ -147,10 +164,12 @@ public:
                         [this](const cabinflow::protocol::MessageEnvelope& request,
                                std::string_view topic, std::string payload) {
                             return gateway_->send_data_output(request, topic,
-                                                              std::move(payload));
+                                                              std::move(payload), MessageKind::kData);
                         }), 8) ==
                     cabinflow::runtime::RuntimeError::kNone,
                 "dialogue target registers");
+        require(runtime_.add_target_node(std::make_unique<OtherTarget>(other_calls_), 2) ==
+                    cabinflow::runtime::RuntimeError::kNone, "second real target registers");
         require(runtime_.start() == cabinflow::runtime::RuntimeError::kNone,
                 "runtime starts before gateway accepts data");
         loop_thread_.run_and_wait([this] {
@@ -175,12 +194,15 @@ public:
     [[nodiscard]] cabinflow::test::RecordingLogger& logger() noexcept {
         return logger_;
     }
+    cabinflow::runtime::Runtime& runtime() noexcept { return runtime_; }
+    int other_calls() const noexcept { return other_calls_.load(); }
 
 private:
     LoopThread loop_thread_;
     cabinflow::runtime::SteadyClock clock_;
     cabinflow::transport::InMemoryTransport transport_;
     cabinflow::test::RecordingLogger logger_;
+    std::atomic<int> other_calls_{0};
     cabinflow::runtime::Runtime runtime_;
     cabinflow::runtime::UnitRegistry registry_;
     std::unique_ptr<cabinflow::gateway::ControlGateway> gateway_;
@@ -421,6 +443,26 @@ void test_typed_data_plane_over_tcp() {
                                          "cockpit.text.unknown", 0, now, 1'000,
                                          text_payload("ignored")));
     read_delivery_error(client.get(), "unknown-target",
+                        cabinflow::protocol::v1::DELIVERY_ERROR_INVALID_ENVELOPE);
+
+    // 已注册的 Unit 可以没有 Runtime Target；归属正确后才独立检验 UNKNOWN_TARGET。
+    cabinflow::protocol::v1::ControlRequest missing_registration;
+    missing_registration.mutable_register_unit()->set_unit_id("missing.target");
+    missing_registration.mutable_register_unit()->add_capabilities("missing");
+    missing_registration.mutable_register_unit()->set_max_concurrent_work(1);
+    send_message(client.get(), make_control("register-missing", "", "", missing_registration));
+    cabinflow::protocol::v1::ControlResponse missing_response;
+    require(missing_response.ParseFromString(read_message(client.get()).payload) &&
+                missing_response.has_register_unit(), "unit without target registers");
+    cabinflow::protocol::v1::ControlRequest missing_setup;
+    missing_setup.mutable_setup()->set_unit_id("missing.target");
+    send_message(client.get(), make_control("setup-missing", "session-text", "", missing_setup));
+    require(missing_response.ParseFromString(read_message(client.get()).payload) &&
+                missing_response.has_setup(), "unit without target creates work");
+    send_message(client.get(), make_data("unknown-owned-target", missing_response.setup().work().work_id(),
+        "missing.target", "cockpit.text.unknown", 0, fixture.clock().now_monotonic_ns(),
+        1'000, text_payload("ignored")));
+    read_delivery_error(client.get(), "unknown-owned-target",
                         cabinflow::protocol::v1::DELIVERY_ERROR_UNKNOWN_TARGET);
 
     const auto expired_created = fixture.clock().now_monotonic_ns() - 2'000'000U;
@@ -600,6 +642,35 @@ void test_work_identity_is_checked_before_ledger_admission() {
             "rejected work identities do not enter the target or poison Ledger");
 }
 
+void test_external_owner_rejection_preserves_admission_and_internal_routing() {
+    GatewayFixture fixture;
+    const auto client = connect_client(fixture.port());
+    const auto work_id = register_and_setup(client.get());
+    auto input = make_data("owner-retry", work_id, "other.primary", "cockpit.text.input", 0,
+        fixture.clock().now_monotonic_ns(), 1'000, text_payload("打开空调"), true);
+    send_message(client.get(), input);
+    const auto error = read_delivery_error(client.get(), "owner-retry",
+        cabinflow::protocol::v1::DELIVERY_ERROR_INVALID_ENVELOPE);
+    require(error.message() == "target_node does not match work unit_id", "explicit ownership detail");
+    require(fixture.other_calls() == 0 && dialogue_message_ids(fixture.logger()).empty(),
+            "neither existing target receives rejected input");
+    input.envelope.target_node = "dialogue.primary";
+    send_message(client.get(), input);
+    cabinflow::agent::v1::TextOutput answer;
+    require(answer.ParseFromString(read_message(client.get()).payload) &&
+                answer.request_message_id() == "owner-retry", "same final/id/sequence retry succeeds after target correction");
+    auto internal = make_data("internal-stage", work_id, "other.primary", "pipeline.stage.probe", 0,
+        fixture.clock().now_monotonic_ns(), 1'000, "opaque", true);
+    auto reservation = fixture.runtime().reserve_target("other.primary");
+    require(static_cast<bool>(reservation), "internal stage reserves second target");
+    std::promise<void> completed;
+    auto finished = completed.get_future();
+    const auto admission = fixture.runtime().admit_reserved(std::move(reservation.reservation),
+        internal, [](auto) {}, [&] { completed.set_value(); });
+    require(admission.admitted && finished.wait_for(1s) == std::future_status::ready &&
+                fixture.other_calls() == 1, "same work still crosses targets internally");
+}
+
 }  // namespace
 
 int main() {
@@ -608,6 +679,7 @@ int main() {
         test_rule_based_intents();
         test_exit_rejects_later_data_without_cancelling_other_work();
         test_work_identity_is_checked_before_ledger_admission();
+        test_external_owner_rejection_preserves_admission_and_internal_routing();
         std::cout << "data plane gateway tcp test passed\n";
         return 0;
     } catch (const std::exception& error) {

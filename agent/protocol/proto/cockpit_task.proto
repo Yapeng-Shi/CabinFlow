@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package cabinflow.agent.v1;
+
+import "cockpit_audio.proto";
+
+message TaskFailure {
+  string message = 1;
+}
+
+message TaskCancelled {
+  string reason = 1;
+}
+
+// 模拟执行事实独立于语音结局：动作后的取消或 TTS 失败不回滚车辆状态。
+message VehicleResult {
+  bool simulated = 1;
+  bool climate_on = 2;
+  bool action_applied = 3;
+  // false 必须与未提供区分；所有准入后的终态写入，消费者拒绝缺失，不猜测“关闭”。
+  optional bool left_front_window_open = 4;
+}
+
+// 唯一业务终态；只在根 handler、下游处理和 work 清理完成后发送。
+// 前端播放是否结束是另一件事，不由这个消息表示。
+message VoiceTaskResult {
+  string request_message_id = 1;
+  string transcript = 2;
+  string answer = 3;
+
+  oneof result {
+    AudioOutput audio = 4;
+    TaskFailure failed = 5;
+    TaskCancelled cancelled = 6;
+  }
+
+  VehicleResult vehicle = 7;
+}

@@ -72,6 +72,12 @@ constexpr std::size_t kMaxTextBytes = 16U * 1024U;
     if (text == "关闭空调") {
         return {v1::COCKPIT_INTENT_CLIMATE_OFF, "识别到关闭空调意图，未执行车控。"};
     }
+    if (text == "打开左前车窗") {
+        return {v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN, "识别到打开左前车窗意图，未执行车控。"};
+    }
+    if (text == "关闭左前车窗") {
+        return {v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_CLOSE, "识别到关闭左前车窗意图，未执行车控。"};
+    }
     if (text == "打开座椅加热" || text == "turn on seat heating") {
         return {v1::COCKPIT_INTENT_SEAT_HEATING_ON,
                 "识别到打开座椅加热意图，未执行车控。"};

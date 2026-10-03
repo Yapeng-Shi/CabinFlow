@@ -114,6 +114,9 @@ target-name mapping, a bounded queue, and one worker for each target. Gateway
 reserves a target slot before it admits the envelope to `SessionLedger`; only
 an accepted envelope is committed to the queue. Payload parsing remains in the
 Agent node, so Runtime and Gateway do not link `CabinFlow::AgentProtocol`.
+All external TCP data targets must match the Unit owning their work; internal
+Runtime delivery can cross Targets within that work. The TCP test verifies that
+an owner rejection does not consume message identity or final state in Ledger.
 
 The first Agent path is `cockpit.text.input -> dialogue.primary ->
 cockpit.text.output`. It uses a
@@ -126,6 +129,14 @@ the client's and Gateway's shared monotonic clock domain for TTL validation.
 The direct Runtime, response-contract, and real TCP
 checks are included in default CTest as `target_runtime_contract_test`,
 `delivery_error_contract_test`, and `data_plane_gateway_tcp_test`.
+
+The real-model Agent application adds one opaque final-task completion hook at
+Gateway assembly. Its Qt/TCP path returns `cockpit.task.result`, not intermediate
+stage output. It keeps Gateway alive while the application cancels and drains
+the root and downstream handlers, then stops Runtime and Gateway from external
+control/owner threads. This is the current synchronous Agent contract, not a
+general asynchronous Runtime API. Build/run and Qt dependencies remain in the
+[Agent guide](../../agent/docs/voice-demo-integration.md), outside Runtime presets.
 
 ## Runtime demo
 

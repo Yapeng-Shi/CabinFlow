@@ -52,7 +52,7 @@ topic values agree before dispatching a handler.
 The TCP data plane uses one framed path and no JSON fallback:
 
 ```text
-TCP Framer -> RuntimeMessage decode -> Envelope validation
+TCP Framer -> RuntimeMessage decode -> Envelope/work-owner validation
   -> target queue reservation -> SessionLedger admission -> queue commit
   -> TargetNode worker -> topic-specific payload decode
 ```
@@ -69,9 +69,21 @@ and `tts.fake` TargetNodes. The CLI validates typed register/setup/exit
 commands through `ControlEnvelopeValidator` and `ControlService`, creates
 the work for `asr.primary`, and submits each typed data stage through Runtime
 reservation and Ledger admission.
-This is not a TCP audio ingress path or a real model pipeline. External first
-message validation against the work-owning Unit is approved but still pending implementation/verification;
-the in-process CLI does not prove that Gateway enforces it.
+That experiment is not a TCP audio ingress path or a real model pipeline.
+Gateway now checks every external data target against the work-owning Unit.
+`data_plane_gateway_tcp_test` verifies rejection before Ledger mutation, a valid
+resubmission, and preserved internal cross-Target delivery under the same work.
+
+The separate real-model Agent app composes this Gateway with `VoicePipeline`.
+Its text/WAV root waits for downstream Runtime completions and emits one
+`cockpit.task.result` after cleanup. Gateway's `DataTaskHooks` reserves/rolls back
+one application task slot and obtains an opaque final output at root completion;
+neither Runtime nor Gateway parses `VoiceTaskResult` or links AgentProtocol.
+Pre-admission errors remain DeliveryError; accepted-task failures become the
+application's final result, avoiding two competing terminal notifications.
+This app drains its root before stopping Runtime: stopping while a root waits
+for queued downstream work would discard that queue and strand the root.
+See the [Agent integration guide](../../agent/docs/voice-demo-integration.md).
 
 Control requests use a separate admission path:
 

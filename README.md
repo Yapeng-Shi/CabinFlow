@@ -8,7 +8,8 @@
 ![Linux](https://img.shields.io/badge/Linux-WSL2-333333?logo=linux)
 ![Protobuf](https://img.shields.io/badge/Protocol-Protobuf-4285F4)
 ![Local inference](https://img.shields.io/badge/Inference-Local_CPU-2E7D32)
-![Project stage](https://img.shields.io/badge/Stage-CLI_Integration-orange)
+![Qt](https://img.shields.io/badge/UI-Qt_6%20%2F%20QML-41CD52?logo=qt)
+![Project stage](https://img.shields.io/badge/Stage-Cockpit_Simulation-orange)
 
 CabinFlow is an **offline intelligent-cockpit voice Agent** built on a reusable
 C++ Runtime. It brings local speech recognition, intent routing, language-model
@@ -18,9 +19,11 @@ The key idea: **separate the system from its models**. Communication, task
 identity, queues, workers and cancellation belong to Runtime; algorithms belong
 to Agent components. Models can evolve without rebuilding the entire application.
 
-> 🚧 Active development: real-model CLI integration is available on x86 CPU /
-> WSL2 / Ubuntu 24.04. The interactive Qt/TCP Demo and target-hardware validation
-> are not complete.
+> 🚧 Active development: real models now connect to a TCP/Qt interface on x86 CPU /
+> WSL2 / Ubuntu 24.04. WSLg playback-start checks passed; human listening,
+> model-quality acceptance and target-hardware validation remain open. Air-conditioning
+> and left-front-window control are explicitly simulated by FakeVehicle, never sent
+> to a real vehicle. A 2.5D driver view visualizes validated execution receipts.
 
 ## 💡 Why CabinFlow?
 
@@ -33,6 +36,7 @@ safely. CabinFlow focuses on making that foundation explicit and reusable.
 - **Runtime-managed execution:** each target has its own bounded queue and single worker, with admission, lifecycle and backpressure handled centrally.
 - **Traceable tasks:** Protobuf messages carry trace, session, work and message identities, sequence, TTL and final markers.
 - **Explicit failure and cancellation:** failures stop downstream processing; cancellation suppresses late results and waits for actual handler completion.
+- **Visible cockpit simulation:** a 2.5D driver view shows climate airflow and left-front-window open/close transitions from typed execution receipts, not optimistic clicks or model claims. Later cancellation or speech failure does not undo an applied action.
 - **Testable boundaries:** contract and integration tests cover protocols, task isolation, queues, lifecycle and component behavior.
 
 No automatic model fallback, legacy-format guessing or plugin framework is added
@@ -45,8 +49,8 @@ to the current pipeline.
 
 WAV ──→ ASR ──→ Dialogue / Router ──→ LLM ──→ TTS ──→ Answer WAV
 Text ─────────→         │                     ↑
-                        └─ Known intent ──────┘
-                           explicit receipt; no vehicle execution yet
+                        └─ Climate / window intent → FakeVehicle → TTS
+                           simulated state + execution receipt
 
                  Runtime: shared execution foundation
 ┌──────────────────────────────────────────────────────────────────┐
@@ -54,8 +58,8 @@ Text ─────────→         │                     ↑
 │ Per-target workers · Cancellation · Transport · Observability     │
 └──────────────────────────────────────────────────────────────────┘
 
-Current entry: CLI
-Next entry:    Qt/QML → TCP Gateway → the same application pipeline
+Product entry: Qt/QML → TCP Gateway → the application pipeline
+CLI:           reuses the same execution chain for local integration checks
 ```
 
 Runtime sees generic `Message` objects, not ASR/LLM/TTS SDK types. Agent nodes
@@ -75,29 +79,30 @@ in one process and uses Runtime-managed execution channels.
 | Communication | TCP, epoll Reactor, Protobuf, ZeroMQ |
 | Local inference | Sherpa-ONNX / ONNX Runtime, llama.cpp |
 | Engineering | CMake, CTest, contract/integration tests, scoped ASan/TSan checks |
-| Planned interface | Qt/QML — not yet a verified UI/playback capability |
+| Interface | Qt 6 / QML, asynchronous TCP client, WAV playback via WSLg |
 
 ## 📍 Current scope
 
-- **Implemented:** generic Runtime, typed TCP control/text paths, injected inference adapters and reusable `VoicePipeline` orchestration.
-- **Executed:** real text/WAV inputs traversing Runtime nodes and producing non-silent answer WAV files.
-- **Next:** connect the real pipeline to TCP/Qt, add playback and user-operated cancellation, then FakeVehicle air-conditioning simulation.
+- **Implemented:** generic Runtime, typed TCP control/data paths, injected inference adapters, reusable `VoicePipeline`, a one-screen Qt client, and a 2.5D cockpit with FakeVehicle climate and left-front-window receipts.
+- **Executed:** real text/WAV inputs through TCP and Runtime nodes; 15 fixed Qt trials archived answer WAVs/screenshots and observed playback-start/cancel-stop states.
+- **Next:** hands-on listening, an operation video and diagnosis of the current Qt/audio LeakSanitizer finding. [Fixed CLI/Qt cases](agent/docs/voice-demo-acceptance-20261003.md) still fail speech-quality expectations.
 - **Not claimed:** complete voice UX, overall model accuracy, production vehicle control, AAOS integration or physical RK3576 deployment.
 
-The CLI currently supports one active task and non-streaming output. It writes
-audio files rather than playing them. `VoicePipeline::cancel()` exists, but the
-CLI has no cancel control. Model-quality issues and human-listening gaps remain
-recorded separately; successful execution is not semantic-quality acceptance.
+The app supports one active task and non-streaming output. Qt provides cancellation
+and waits for actual task cleanup before accepting another input; CLI writes audio
+files and has no cancel control. Model-quality issues and human-listening gaps
+remain recorded separately; execution and player state are not quality acceptance.
 
 ## 📂 Project layout
 
 ```text
 runtime/                 Generic execution, network, Gateway and Transport
 agent/
-  apps/voice_demo/       Real-model CLI and application assembly
+  apps/voice_demo/       Real-model CLI, TCP server and Qt/QML frontend
   inference/             Backend interfaces and native SDK adapters
   pipeline/              Reusable voice orchestration
   dialogue/              Typed text node and rule-based routing
+  vehicle/               Explicit FakeVehicle climate / window simulation
   protocol/              Cockpit-domain Protobuf schemas
   scripts/               Dependency/model preparation and test runners
   tests/                 Agent contract and runner tests
@@ -127,7 +132,10 @@ This deterministic example exercises two sessions, ordering, expiry, final and
 cancellation; it is not a speech demo. Use `runtime/scripts/`, not the historical
 `runtime/build.sh` dependency installer.
 
-**Prepare and build the real-model CLI:**
+**Prepare and build the voice application:**
+
+Install the [Qt/audio dependencies](agent/docs/voice-demo-integration.md#qt-依赖与交互入口)
+first; the standalone Runtime build does not require them.
 
 ```bash
 bash agent/scripts/prepare_x86_inference.sh
@@ -142,16 +150,15 @@ SDKs and downloaded LLM/TTS files are Git-ignored local artifacts, not included
 in a fresh clone. Scripts pin sources and checksums. Runtime includes ZeroMQ
 build targets even when the Demo uses in-process execution.
 
-See the [real-model CLI guide](agent/docs/voice-demo-integration.md) for exact
-model paths, text/WAV commands, result files and verification records. Inputs
+See the [voice application guide](agent/docs/voice-demo-integration.md) for the
+backend/frontend launch commands, model paths, CLI results and verification. Inputs
 must be complete **16 kHz mono PCM16 WAV** files; the full encoded message body
 must fit within **4 MiB**, and each output directory must be new.
 
 ## 🧭 Roadmap
 
-1. **Interactive loop:** TCP/Qt input, transcript/answer display and playback.
-2. **Task control:** visible cancellation and cleanup, with stale results suppressed.
-3. **Cockpit simulation:** explicitly labeled FakeVehicle state and repeatable demo cases.
+1. **Experience acceptance:** hands-on listening, fixed voice cases and cancellation demos.
+2. **Showcase:** reproducible commands, scoped measurements and an operation video.
 
 RAG, live recording/wake words, multi-occupant interaction, AAOS and hardware
 optimization are deferred until the first interactive Demo is usable.
@@ -161,6 +168,7 @@ optimization are deferred until the first interactive Demo is usable.
 - [Implementation plan](plans/IMPLEMENTATION_PLAN.md) · [Directory plan](plans/RUNTIME_DIRECTORY_STRUCTURE.md)
 - [Runtime architecture](runtime/docs/architecture.md) · [Build and development](runtime/docs/development.md)
 - [Real-component integration and test evidence](agent/docs/voice-demo-integration.md)
+- [Fixed-case results, timing boundaries and showcase checklist](agent/docs/voice-demo-acceptance-20261003.md)
 - [Model versions and dependency audit](agent/docs/model-dependency-audit.md) · [Quality and known failures](agent/docs/demo-model-progress-20261002.md)
 - [Runtime migration progress](runtime/docs/runtime-migration-closeout.md) · [Capability ledger](runtime/docs/capability-migration.md)
 - [Fake voice demo](agent/docs/fake-voice-milestone.md): message/state validation with test audio, not real inference or a fallback.
