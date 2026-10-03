@@ -150,6 +150,18 @@ SDKs and downloaded LLM/TTS files are Git-ignored local artifacts, not included
 in a fresh clone. Scripts pin sources and checksums. Runtime includes ZeroMQ
 build targets even when the Demo uses in-process execution.
 
+**Start or stop the cockpit Demo from WSL:**
+
+```bash
+bash agent/scripts/voice_demo.sh start
+bash agent/scripts/voice_demo.sh stop
+```
+
+The launcher waits for the backend before opening the WSLg window. Closing the
+window does not stop the backend; use `stop` to shut down its recorded processes.
+Logs are kept under `runtime/build/voice-demo/launcher/run-*/`. It does not
+automatically build, download models or force-kill a server still cleaning up.
+
 See the [voice application guide](agent/docs/voice-demo-integration.md) for the
 backend/frontend launch commands, model paths, CLI results and verification. Inputs
 must be complete **16 kHz mono PCM16 WAV** files; the full encoded message body

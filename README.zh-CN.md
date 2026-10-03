@@ -140,7 +140,18 @@ SDK 与下载的 LLM/TTS 文件是 Git 忽略的本地产物，新克隆不包�
 脚本锁定来源与校验值。Runtime 构建包含 ZeroMQ 目标，即使 Demo 使用进程内路径
 也需要对应开发库。
 
-双终端前后端启动、具体模型路径、CLI 结果文件与验证记录见
+**在 WSL 中启动或停止座舱 Demo：**
+
+```bash
+bash agent/scripts/voice_demo.sh start
+bash agent/scripts/voice_demo.sh stop
+```
+
+脚本等后端就绪后打开 WSLg 窗口；关闭窗口不会自动停后端，请使用 `stop`。
+日志保存在 `runtime/build/voice-demo/launcher/run-*/`；不自动构建、下载模型或
+强杀仍在清理的服务，只操作本脚本启动并核验身份的进程。
+
+具体模型路径、单独调试启动命令、CLI 结果文件与验证记录见
 [语音应用指南](agent/docs/voice-demo-integration.md)。输入必须是完整的
 **16 kHz mono PCM16 WAV**，整个编码消息体不能超过 **4 MiB**，每次使用全新输出目录。
 

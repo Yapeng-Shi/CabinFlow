@@ -3,7 +3,7 @@
 更新：2026-10-03。按用户确认，先搭系统并解耦；模型质量独立验收，不阻塞集成。
 CLI 与 TCP/Qt 已共用真实组件流水线；窗口、回传和播放器状态已有 x86/WSLg 验证。
 FakeVehicle 空调/左前车窗开关及 2.5D 回执驱动界面已接入；CLI 与 Qt 各固定 5×3 次
-及真实 Qt/LLM 任务中退出的历史记录保留。本轮 Debug 33/33、Python 27/27；ASan 2/3，
+及真实 Qt/LLM 任务中退出的历史记录保留。最近产品 Debug 33/33、既有 Python 27/27；ASan 2/3，
 Qt 音频相关 LSan 本轮首次报 1,672 字节/19 分配、最终复跑 264 字节/3 分配，仍未解决。人工听验、语音语义质量与完整展示尚未通过，
 因此不是完整 Demo 验收。
 
@@ -74,7 +74,23 @@ media backend、跳过音频接口或压制错误。首次截图中文缺字，�
 为空后补齐 Noto CJK；Qt Wayland 插件也已安装。Wayland 测试仍有 Mesa/EGL 驱动警告，
 窗口曝光和截图成功，不能据此声称 GPU 加速验证。
 
-按照下节 CMake 命令构建后，在两个 WSL 终端分别运行：
+按照下节 CMake 命令构建并准备模型后，推荐在 WSL 终端使用统一启停脚本：
+
+```bash
+cd /home/projects/CabinFlow
+bash agent/scripts/voice_demo.sh start
+bash agent/scripts/voice_demo.sh stop
+```
+
+`start` 后台启动模型后端，等本次日志中的 TCP ready 标记后打开 WSLg 窗口。
+固定使用 `127.0.0.1:39001` 和现有模型，不自动构建或下载。
+日志保存在 `runtime/build/voice-demo/launcher/run-*/`；`server.pid`、`ui.pid` 只记录 PID。
+`stop` 核验项目二进制和用户后发 SIGTERM：先等后端清理退出，再停 Qt。
+关闭窗口不会自动停后端，请再运行 `stop`。每个进程最多等 30 秒，超时保留记录、不强杀。
+这是本机开发启停工具，不提供生产进程管理或原子 PID 身份保证；记录损坏、身份不符
+或磁盘写入失败时需要人工检查，不要随意删除仍存活进程的 PID 文件。
+
+需要单独调试前后端时，仍可在两个 WSL 终端直接运行同一组二进制：
 
 ```bash
 cd /home/projects/CabinFlow
@@ -89,7 +105,7 @@ cd /home/projects/CabinFlow
 QT_QPA_PLATFORM=wayland runtime/build/voice-demo/frontend/voice_demo_ui 127.0.0.1 39001
 ```
 
-后端命令已实际执行；交互前端已编译，以下 live probe 用同一 VoiceClient/QML 窗口实际
+后端命令已实际执行；以下 live probe 用同一 VoiceClient/QML 窗口实际
 驱动输入和播放。上述直接 UI 启动命令尚未另外手工操作一轮。服务退出用 Ctrl+C 或
 SIGTERM；模型调用若未返回，仍等待清理，不以强制杀进程冒充正常退出。
 
