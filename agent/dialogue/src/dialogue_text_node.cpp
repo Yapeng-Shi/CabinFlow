@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <charconv>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -90,6 +92,43 @@ constexpr std::size_t kMaxTextBytes = 16U * 1024U;
             "未识别到支持的座舱意图，未执行车控。"};
 }
 
+std::optional<v1::MusicCommand> recognize_music(std::string_view text) {
+    v1::MusicCommand command;
+    if (text.substr(0, std::string_view("搜索").size()) == "搜索") {
+        auto keyword = text.substr(std::string_view("搜索").size());
+        const auto first = keyword.find_first_not_of(" \t\r\n");
+        if (first != std::string_view::npos)
+            keyword = keyword.substr(first, keyword.find_last_not_of(" \t\r\n") - first + 1);
+        else keyword = {};
+        command.set_action(v1::MusicCommand::SEARCH);
+        command.set_keyword(std::string(keyword));
+    } else if (text == "播放音乐" || text == "继续播放") {
+        command.set_action(v1::MusicCommand::PLAY);
+    } else if (text == "暂停音乐") {
+        command.set_action(v1::MusicCommand::PAUSE);
+    } else if (text == "上一首") {
+        command.set_action(v1::MusicCommand::PREVIOUS);
+    } else if (text == "下一首") {
+        command.set_action(v1::MusicCommand::NEXT);
+    } else if (text.substr(0, std::string_view("播放第").size()) == "播放第" &&
+               text.size() > std::string_view("播放第首").size() &&
+               text.substr(text.size() - std::string_view("首").size()) == "首") {
+        const auto ordinal = text.substr(std::string_view("播放第").size(),
+            text.size() - std::string_view("播放第首").size());
+        std::uint32_t index = 0;
+        const auto parsed = std::from_chars(ordinal.data(), ordinal.data() + ordinal.size(), index);
+        if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size()) {
+            constexpr std::string_view numbers[] = {"一", "二", "三", "四", "五", "六", "七", "八", "九", "十"};
+            index = 0;
+            for (std::uint32_t i = 0; i < 10; ++i) if (ordinal == numbers[i]) index = i + 1;
+        }
+        // 格式已命中但编号非法时保留 SELECT(0)，下游显式拒绝，不交给 LLM 猜执行。
+        command.set_action(v1::MusicCommand::SELECT);
+        command.set_result_index(index);
+    } else return std::nullopt;
+    return command;
+}
+
 }  // namespace
 
 DialogueTextNode::DialogueTextNode(OutputHandler output_handler)
@@ -151,12 +190,18 @@ runtime::MessageHandlingResult DialogueTextNode::on_text_input(
     }
 
     // 分片属于同一 work 的输入流；只在 final 到达时识别一次并回传原请求连接。
+    const auto music = recognize_music(found->second);
     const auto [intent, reply] = recognize_intent(found->second);
     buffered_inputs_.erase(found);
     v1::TextOutput output;
     output.set_request_message_id(envelope.message_id);
     output.set_intent(intent);
     output.set_text(std::string(reply));
+    if (music) {
+        output.set_intent(v1::COCKPIT_INTENT_MUSIC);
+        *output.mutable_music_command() = *music;
+        output.set_text("音乐指令已识别，尚未执行播放器操作。");
+    }
     std::string payload;
     if (!output.SerializeToString(&payload) ||
         !output_handler_(envelope, "cockpit.text.output", std::move(payload))) {

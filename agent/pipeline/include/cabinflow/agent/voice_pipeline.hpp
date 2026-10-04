@@ -5,6 +5,7 @@
 #include <string>
 
 #include <cabinflow/agent/fake_vehicle.hpp>
+#include <cockpit_text.pb.h>
 #include <cabinflow/agent/inference/backends.hpp>
 #include <cabinflow/gateway/control_gateway.hpp>
 
@@ -30,6 +31,7 @@ struct VoiceResult {
     std::string answer;
     inference::WavAudio audio;
     std::optional<VehicleReceipt> vehicle;
+    std::optional<v1::MusicCommand> music_command;
 };
 
 // 编排拥有模型，Runtime 拥有独立 Target 队列/worker；UI/CLI 不包含 SDK 类型。

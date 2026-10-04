@@ -13,6 +13,7 @@
 #include <control.pb.h>
 #include <delivery.pb.h>
 #include <cabinflow/gateway/control_service.hpp>
+#include <cabinflow/agent/music_command.hpp>
 
 namespace {
 using cabinflow::protocol::Message;
@@ -20,20 +21,21 @@ using cabinflow::protocol::MessageKind;
 std::string unique_id() { return QUuid::createUuid().toString(QUuid::Id128).toStdString(); }
 }
 
-VoiceClient::VoiceClient(QString host, quint16 port, QObject* parent)
-    : QObject(parent), host_(std::move(host)), port_(port) {
+VoiceClient::VoiceClient(QString host, quint16 port, MusicController& music, QObject* parent)
+    : QObject(parent), host_(std::move(host)), port_(port), music_(music) {
     player_.setAudioOutput(&audio_output_);
     connect(&socket_, &QTcpSocket::connected, this, [this] { status_ = "就绪"; emit changed(); });
     connect(&socket_, &QTcpSocket::disconnected, this, [this] {
         clearAudio();
         controls_.clear();
         busy_ = false;
+        music_.releaseVoice();
         vehicle_known_ = false;
         vehicle_action_ = "断连，执行状态未知";
         status_ = "已断连";
         error_ = "连接已断开；后端任务状态未知，不自动重连";
         emit changed();
-        if (closing_) emit closeReady();
+        maybeClose();
     });
     connect(&socket_, &QTcpSocket::errorOccurred, this, [this](auto) { fail(socket_.errorString()); });
     connect(&socket_, &QTcpSocket::readyRead, this, [this] {
@@ -42,17 +44,34 @@ VoiceClient::VoiceClient(QString host, quint16 port, QObject* parent)
         for (const auto& message : framed.messages) receive(message);
         if (!framed) fail("非法 TCP 帧；不尝试其他协议", true);
     });
-    connect(&player_, &QMediaPlayer::playbackStateChanged, this, [this](auto) { emit changed(); });
-    connect(&player_, &QMediaPlayer::errorOccurred, this, [this](auto, const QString& detail) {
-        error_ = "播放失败：" + detail;
+    connect(&player_, &QMediaPlayer::playbackStateChanged, this, [this](auto state) {
+        if (clearing_audio_) return;
+        if (state == QMediaPlayer::StoppedState) {
+            ++answer_generation_; answer_pending_ = false; music_.stopAnswer();
+        }
         emit changed();
     });
+    connect(&player_, &QMediaPlayer::errorOccurred, this, [this](auto, const QString& detail) {
+        error_ = "播放失败：" + detail;
+        ++answer_generation_; answer_pending_ = false; music_.stopAnswer();
+        emit changed();
+    });
+    connect(&music_, &MusicController::answerReady, this, [this](quint64 generation) {
+        if (generation != answer_generation_ || !answer_pending_ || busy_ || closing_ || !audio_file_) return;
+        answer_pending_ = false; player_.play();
+    });
+    connect(&music_, &MusicController::answerFailed, this, [this](quint64 generation, const QString& detail) {
+        if (generation != answer_generation_ || !answer_pending_) return;
+        answer_pending_ = false; error_ = detail; emit changed();
+    });
+    connect(&music_, &MusicController::closeReady, this, &VoiceClient::maybeClose);
 }
 
 VoiceClient::~VoiceClient() {
     // 成员析构仍可能触发信号；先断开回调，再停播放器/解除文件，避免访问已销毁的状态。
     socket_.disconnect(this);
     player_.disconnect(this);
+    music_.disconnect(this);
     clearAudio();
     socket_.abort();
 }
@@ -119,12 +138,15 @@ void VoiceClient::startWav(const QUrl& file) {
 
 void VoiceClient::begin(bool audio, std::string payload) {
     if (busy_ || closing_ || !connected()) return;
+    if (music_.busy()) { error_ = "音乐操作尚未静止，请稍后开始语音任务"; emit changed(); return; }
     clearAudio();
+    if (!music_.acquireVoice()) { error_ = "等待音乐音量恢复后再开始任务"; emit changed(); return; }
     transcript_.clear(); answer_.clear(); error_.clear();
     session_ = unique_id(); trace_ = unique_id(); work_.clear(); input_id_.clear();
     audio_input_ = audio; payload_ = std::move(payload);
     unit_ = audio ? "asr.primary" : "dialogue.primary";
     cancel_requested_ = false; input_sent_ = false; cleanup_rejection_ = false;
+    terminal_consumed_ = false;
     busy_ = true; status_ = "创建任务";
     vehicle_action_ = "本次动作：等待回执";
     auto request = envelope("control.request", "runtime.control");
@@ -224,27 +246,36 @@ void VoiceClient::receive(const Message& message) {
         error_ = QString::fromStdString(error.message()); cleanup_rejection_ = true;
         status_ = "失败，清理中"; sendExit(true);
     } else if (e.topic == "cockpit.task.result") {
-        if (e.session_id != session_ || e.work_id != work_ || !busy_) return;
+        if (e.session_id != session_ || e.work_id != work_ || !busy_ || terminal_consumed_) return;
         cabinflow::agent::v1::VoiceTaskResult result;
         if (!result.ParseFromString(message.payload) || result.request_message_id() != input_id_ ||
             e.trace_id != trace_ || e.source_node != unit_ || e.message_id == input_id_ ||
             result.result_case() == cabinflow::agent::v1::VoiceTaskResult::RESULT_NOT_SET ||
             !result.has_vehicle() || !result.vehicle().simulated() ||
             !result.vehicle().has_left_front_window_open() ||
-            e.kind != (result.has_audio() ? MessageKind::kData : MessageKind::kError)) {
+            e.kind != ((result.has_audio() || result.has_music_command()) ? MessageKind::kData : MessageKind::kError)) {
             fail("任务终态关联/类型无效", true); return;
         }
         // 完整业务身份先校验；非法音频不能在 fail 的 changed 信号中短暂暴露伪造车控状态。
         if (result.has_audio() && (result.audio().request_message_id() != input_id_ || result.audio().wav_bytes().empty())) {
             fail("回答音频关联无效", true); return;
         }
+        if (result.has_music_command() && !cabinflow::agent::is_valid_music_command(result.music_command())) {
+            fail("音乐指令类型或参数无效", true); return;
+        }
+        // 任何外部信号/播放器调用前一次性消费当前终态，重复响应不能重放音乐动作。
+        terminal_consumed_ = true;
         transcript_ = QString::fromStdString(result.transcript());
         // 执行事实先于音频处理：取消、TTS 失败或本地播放器错误都不抹掉已执行的动作。
         vehicle_known_ = true;
         climate_on_ = result.vehicle().climate_on();
         left_front_window_open_ = result.vehicle().left_front_window_open();
         vehicle_action_ = result.vehicle().action_applied() ? "本次动作：已执行（模拟）" : "本次动作：未执行";
-        if (result.has_audio()) {
+        if (result.has_music_command()) {
+            answer_.clear(); clearAudio();
+            if (!cancel_requested_ && !closing_) music_.executeFromVoice(result.music_command());
+            terminal(cancel_requested_ || closing_ ? "已取消（音乐未发起）" : "音乐指令已识别（执行结果见中控）");
+        } else if (result.has_audio()) {
             answer_ = QString::fromStdString(result.answer());
             audio_file_ = std::make_unique<QTemporaryFile>(QDir::tempPath() + "/cabinflow-XXXXXX.wav");
             if (!audio_file_->open() || audio_file_->write(result.audio().wav_bytes().data(),
@@ -265,31 +296,51 @@ void VoiceClient::receive(const Message& message) {
 }
 
 void VoiceClient::cancel() {
+    const bool cancelling_task = busy_;
+    const auto cancelling_session = session_;
+    // stopPlayback 会同步发信号，监听器可能重入并收到终态；先提交取消，禁止该终态发起音乐。
+    if (cancelling_task) { cancel_requested_ = true; status_ = "取消中"; }
     stopPlayback();
-    if (!busy_) return;
-    cancel_requested_ = true; status_ = "取消中";
+    // 重入终态还可能启动下一任务，不能把旧取消发到新的 work。
+    if (!cancelling_task || !busy_ || session_ != cancelling_session) return;
     if (!work_.empty()) sendExit(!input_sent_);
     emit changed();
 }
 void VoiceClient::play() {
-    if (!busy_ && audio_file_ && !closing_) player_.play();
+    if (!busy_ && audio_file_ && !closing_ && !playing() && !answer_pending_) {
+        answer_pending_ = true;
+        music_.prepareAnswer(++answer_generation_);
+    }
 }
-void VoiceClient::stopPlayback() { player_.stop(); emit changed(); }
+void VoiceClient::stopPlayback() {
+    ++answer_generation_; answer_pending_ = false;
+    music_.stopAnswer(); player_.stop(); emit changed();
+}
 void VoiceClient::clearAudio() {
+    clearing_audio_ = true;
+    ++answer_generation_; answer_pending_ = false; music_.stopAnswer();
     player_.stop(); player_.setSource(QUrl{}); audio_file_.reset();
+    clearing_audio_ = false;
 }
 void VoiceClient::terminal(QString state) {
+    music_.releaseVoice();
     busy_ = false; status_ = std::move(state); emit changed();
-    if (closing_) { clearAudio(); emit closeReady(); }
+    if (closing_) clearAudio();
+    maybeClose();
 }
 void VoiceClient::fail(QString detail, bool disconnect) {
     clearAudio(); answer_.clear(); error_ = std::move(detail); busy_ = false; status_ = "失败";
+    music_.releaseVoice();
     emit changed();
     if (disconnect) socket_.abort();
-    if (closing_) emit closeReady();
+    maybeClose();
 }
 void VoiceClient::requestClose() {
     closing_ = true;
-    if (!busy_ || !connected()) { clearAudio(); emit closeReady(); }
+    clearAudio(); music_.requestClose();
+    if (!busy_ || !connected()) { busy_ = false; music_.releaseVoice(); maybeClose(); }
     else cancel();
+}
+void VoiceClient::maybeClose() {
+    if (closing_ && !busy_ && music_.isClosed()) emit closeReady();
 }

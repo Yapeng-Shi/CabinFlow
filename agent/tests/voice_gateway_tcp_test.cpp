@@ -36,6 +36,7 @@ struct Evidence {
     bool block{false}, entered{false}, release{false};
     bool fail_tts{false};
     std::atomic<unsigned> llm_calls{0};
+    std::atomic<unsigned> tts_calls{0};
 };
 class Asr final : public AsrBackend {
     BackendResult<std::string> transcribe(std::string_view, const CancellationCheck&) override {
@@ -57,6 +58,7 @@ class Tts final : public TtsBackend {
 public:
     explicit Tts(Evidence& evidence) : evidence_(evidence) {}
     BackendResult<WavAudio> synthesize(std::string_view, const CancellationCheck&) override {
+        ++evidence_.tts_calls;
         std::unique_lock<std::mutex> lock(evidence_.mutex);
         if (evidence_.block) {
             evidence_.entered = true;
@@ -179,10 +181,10 @@ Message text(const std::string& id, const std::string& session, const std::strin
     cabinflow::agent::v1::TextInput body; body.set_text(value); request.payload = body.SerializeAsString();
     return request;
 }
-cabinflow::agent::v1::VoiceTaskResult terminal(Client& client, const Message& input, bool audio) {
+cabinflow::agent::v1::VoiceTaskResult terminal(Client& client, const Message& input, bool success) {
     const auto message = client.read();
     const auto& e = message.envelope;
-    require(e.topic == "cockpit.task.result" && e.is_final && e.kind == (audio ? MessageKind::kData : MessageKind::kError),
+    require(e.topic == "cockpit.task.result" && e.is_final && e.kind == (success ? MessageKind::kData : MessageKind::kError),
             "one typed final task outcome, not intermediate output");
     require(e.message_id != input.envelope.message_id && e.session_id == input.envelope.session_id &&
         e.work_id == input.envelope.work_id && e.trace_id == input.envelope.trace_id &&
@@ -341,8 +343,23 @@ void window_receipts() {
     require(result.has_cancelled() && !result.vehicle().left_front_window_open() && result.vehicle().climate_on() &&
             result.vehicle().action_applied() && !result.has_audio(), "TCP cancel keeps window action fact, suppresses audio");
 }
+void music_commands() {
+    Fixture fixture; Client client(fixture.port());
+    using Command = cabinflow::agent::v1::MusicCommand;
+    for (const auto& item : {std::pair<const char*, Command::Action>{"搜索周杰伦", Command::SEARCH},
+                            {"播放第二首", Command::SELECT}, {"暂停音乐", Command::PAUSE}}) {
+        const auto session = "music-" + std::to_string(static_cast<int>(item.second));
+        auto input = text(session + ":input", session, setup(client, session + ":setup", session), item.first);
+        client.send(input); const auto result = terminal(client, input, true);
+        require(result.has_music_command() && result.music_command().action() == item.second &&
+            !result.has_audio() && !result.vehicle().action_applied(), "real TCP transports typed non-audio instruction, not playback success");
+        if (item.second == Command::SELECT) require(result.music_command().result_index() == 2, "one-based voice selection preserved");
+        client.no_response();
+    }
+    require(fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 0, "music skips both model generation and synthesis");
+}
 }  // namespace
 int main() {
-    try { success_and_invalid(); cancellation_and_busy(); invalid_exit_preserves_task(); vehicle_receipts(); window_receipts(); std::cout << "voice_gateway_tcp_test passed\n"; return 0; }
+    try { success_and_invalid(); cancellation_and_busy(); invalid_exit_preserves_task(); vehicle_receipts(); window_receipts(); music_commands(); std::cout << "voice_gateway_tcp_test passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

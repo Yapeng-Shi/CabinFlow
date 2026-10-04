@@ -1,4 +1,5 @@
 #include "voice_client.hpp"
+#include "music_test_backend.hpp"
 #include <cockpit_task.pb.h>
 #include <control.pb.h>
 #include <delivery.pb.h>
@@ -41,9 +42,9 @@ bool wait_until(const std::function<bool()>& ready, int timeout_ms = 2000) {
 }
 class Fixture {
 public:
-    Fixture() {
+    explicit Fixture(std::unique_ptr<MusicBackend> backend = {}) : music(std::move(backend)) {
         require(server.listen(QHostAddress::LocalHost, 0), "listen Qt contract peer");
-        client = std::make_unique<VoiceClient>("127.0.0.1", server.serverPort());
+        client = std::make_unique<VoiceClient>("127.0.0.1", server.serverPort(), music);
         client->connectBackend();
         require(wait_until([this] { return server.hasPendingConnections() && client->connected(); }), "Qt socket connects asynchronously");
         peer = server.nextPendingConnection();
@@ -128,6 +129,7 @@ public:
         result.mutable_audio()->set_wav_bytes(wav.constData(), static_cast<std::size_t>(wav.size()));
         message.payload = result.SerializeAsString(); send(message);
     }
+    MusicController music;
     QTcpServer server;
     QTcpSocket* peer{nullptr};
     std::unique_ptr<VoiceClient> client;
@@ -188,6 +190,7 @@ void invalid_cleanup_and_disconnect() {
 }
 void qml_window() {
     Fixture f; QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", f.client.get());
+    engine.rootContext()->setContextProperty("musicController", &f.music);
     engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "one-screen QML window loads without component errors");
     f.client->requestClose();
 }
@@ -258,6 +261,7 @@ void answer_audio_path_contract() {
 }
 void cockpit_scene_contract() {
     Fixture f; QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", f.client.get());
+    engine.rootContext()->setContextProperty("musicController", &f.music);
     engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "cockpit screen loads");
     auto* scene = engine.rootObjects().front()->findChild<QObject*>("cockpitScene");
     require(scene && !scene->property("stateKnown").toBool() && !scene->property("glassVisible").toBool() &&
@@ -292,6 +296,7 @@ void invalid_vehicle_result_never_updates_view() {
     for (int kind = 0; kind < 5; ++kind) {
         bool forged_seen = false;
         Fixture f; QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", f.client.get());
+        engine.rootContext()->setContextProperty("musicController", &f.music);
         engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "invalid-result scene loads");
         auto* scene = engine.rootObjects().front()->findChild<QObject*>("cockpitScene"); require(scene, "scene available");
         QObject observer;
@@ -361,8 +366,10 @@ int cases_probe(quint16 port, const QString& cases_path, const QString& output_d
         {"human_listening", "not_verified"}, {"answer_semantics", "not_verified"},
         {"probe_binary_sha256", sha256(read_file(QCoreApplication::applicationFilePath()))}};
     save_json(report_path, report);
-    VoiceClient client("127.0.0.1", port);
+    MusicController music;
+    VoiceClient client("127.0.0.1", port, music);
     QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", &client);
+    engine.rootContext()->setContextProperty("musicController", &music);
     engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "cases QML window loads");
     auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().front());
     require(window && wait_until([&] { return window->isExposed(); }, 10000), "cases window exposed");
@@ -443,8 +450,10 @@ int cases_probe(quint16 port, const QString& cases_path, const QString& output_d
     return observed_failure ? 1 : 0;
 }
 void live_probe(quint16 port, const QString& wav_path, const QString& output_dir) {
-    VoiceClient client("127.0.0.1", port);
+    MusicController music;
+    VoiceClient client("127.0.0.1", port, music);
     QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", &client);
+    engine.rootContext()->setContextProperty("musicController", &music);
     engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "live WSLg QML window loads");
     auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().front());
     require(window && wait_until([&] { return window->isExposed(); }, 10000), "live window is exposed by WSLg");
@@ -557,8 +566,10 @@ void live_probe(quint16 port, const QString& wav_path, const QString& output_dir
 }
 void shutdown_probe(quint16 port) {
     bool cancelled_before_disconnect = false;
-    VoiceClient client("127.0.0.1", port);
+    MusicController music;
+    VoiceClient client("127.0.0.1", port, music);
     QQmlApplicationEngine engine; engine.rootContext()->setContextProperty("voiceClient", &client);
+    engine.rootContext()->setContextProperty("musicController", &music);
     engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "shutdown probe window loads");
     client.connectBackend(); require(wait_until([&] { return client.connected(); }, 10000), "shutdown probe connects");
     QObject::connect(&client, &VoiceClient::changed, [&] {
@@ -573,11 +584,107 @@ void shutdown_probe(quint16 port) {
             "disconnect keeps backend state unknown and clears audio, not a synthetic success");
     std::cout << "shutdown_probe disconnected=1 cancelled_before_disconnect=" << cancelled_before_disconnect << '\n';
 }
+void music_terminal_contract() {
+    auto* backend = new TestMusicBackend;
+    Fixture f{std::unique_ptr<MusicBackend>(backend)};
+    f.music.search("test"); backend->found({{"encrypted", "1", "测试歌曲", "测试歌手", true}});
+    auto result_message = [&](const Message& input) {
+        auto message = f.response(input, "cockpit.task.result");
+        cabinflow::agent::v1::VoiceTaskResult result;
+        result.set_request_message_id(input.envelope.message_id);
+        result.mutable_vehicle()->set_simulated(true);
+        result.mutable_vehicle()->set_left_front_window_open(false);
+        result.mutable_music_command()->set_action(cabinflow::agent::v1::MusicCommand::SELECT);
+        result.mutable_music_command()->set_result_index(1);
+        message.payload = result.SerializeAsString(); return message;
+    };
+    f.client->startText("播放第一首"); f.setup(f.take()); const auto first = f.take();
+    f.music.search("blocked"); require(backend->calls.size() == 1, "voice submission locks visible list in C++");
+    const auto terminal = result_message(first); f.send(terminal); f.send(terminal);
+    require(wait_until([&] { return !f.client->busy(); }), "typed non-audio music outcome accepted");
+    require(backend->calls.size() == 2 && backend->calls.back().action == "play" && !f.client->hasAudio(),
+            "duplicate final result issues one music command, never answer WAV");
+    backend->acknowledge(); backend->state(MusicSnapshot::State::kPlaying);
+    f.client->startText("下一条"); f.setup(f.take(), "new-music-work"); const auto second = f.take();
+    f.send(terminal); f.client->cancel(); static_cast<void>(f.take()); f.send(result_message(second));
+    require(wait_until([&] { return !f.client->busy(); }) && backend->calls.size() == 3 &&
+        f.client->status().contains("音乐未发起"), "old final and committed-but-locally-cancelled music never replay");
+    f.client->startText("关闭前任务"); f.setup(f.take(), "closing-work"); const auto closing_input = f.take();
+    bool closed = false; QObject::connect(f.client.get(), &VoiceClient::closeReady, [&] { closed = true; });
+    f.client->requestClose(); static_cast<void>(f.take()); f.send(result_message(closing_input));
+    require(wait_until([&] { return !f.client->busy(); }) && !closed && backend->shutdown_requested,
+            "window waits for both voice cleanup and music cleanup");
+    const auto calls = backend->calls.size(); emit backend->closed();
+    require(closed && backend->calls.size() == calls, "close proof releases window without new playback");
+
+    Fixture invalid; invalid.client->startText("music"); invalid.setup(invalid.take()); const auto input = invalid.take();
+    auto message = invalid.response(input, "cockpit.task.result"); cabinflow::agent::v1::VoiceTaskResult bad;
+    bad.set_request_message_id(input.envelope.message_id); bad.mutable_vehicle()->set_simulated(true);
+    bad.mutable_vehicle()->set_left_front_window_open(true); bad.mutable_music_command();
+    message.payload = bad.SerializeAsString(); invalid.send(message);
+    require(wait_until([&] { return !invalid.client->connected(); }) && !invalid.client->vehicleKnown(),
+            "invalid typed music rejected before exposing forged receipt");
+}
+
+void cockpit_preview(const QString& directory) {
+    require(!QFileInfo::exists(directory) && QDir().mkdir(directory), "preview output must be a new directory");
+    Fixture f; QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("voiceClient", f.client.get());
+    engine.rootContext()->setContextProperty("musicController", &f.music);
+    engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(), "preview QML loads");
+    auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().front()); require(window, "preview window");
+    auto capture = [&](int width, int height, const QString& filename) {
+        window->resize(width, height);
+        require(wait_until([&] { return window->isExposed(); }), "preview exposed");
+        QElapsedTimer rendering; rendering.start();
+        require(wait_until([&] { return rendering.elapsed() >= 200; }), "allow Canvas and layout to settle");
+        const auto image = window->grabWindow();
+        require(!image.isNull() && image.save(QDir(directory).filePath(filename)), "save actual Qt rendered preview");
+    };
+    capture(1440, 900, "cockpit-1440.png");
+    capture(1080, 740, "cockpit-1080.png");
+    capture(720, 580, "cockpit-720.png");
+    auto* scroll = window->findChild<QObject*>("cockpitBodyScroll"); require(scroll, "responsive body scroll exists");
+    auto* content = scroll->property("contentItem").value<QObject*>(); require(content, "scroll content");
+    content->setProperty("contentY", std::max(0.0, content->property("contentHeight").toDouble() - content->property("height").toDouble()));
+    capture(720, 580, "cockpit-720-voice.png");
+    std::cout << "preview=actual_Qt_render music=disabled vehicle=unknown models=not_run directory="
+              << directory.toStdString() << '\n';
+    f.client->requestClose();
+}
+void reentrant_music_cancel_contract() {
+    auto* backend = new TestMusicBackend;
+    Fixture f{std::unique_ptr<MusicBackend>(backend)};
+    f.music.search("test"); backend->found({{"encrypted", "1", "测试歌曲", "测试歌手", true}});
+    f.client->startText("播放第一首"); f.setup(f.take()); const auto input = f.take();
+    auto message = f.response(input, "cockpit.task.result"); cabinflow::agent::v1::VoiceTaskResult result;
+    result.set_request_message_id(input.envelope.message_id); result.mutable_vehicle()->set_simulated(true);
+    result.mutable_vehicle()->set_left_front_window_open(false);
+    result.mutable_music_command()->set_action(cabinflow::agent::v1::MusicCommand::SELECT);
+    result.mutable_music_command()->set_result_index(1); message.payload = result.SerializeAsString();
+    bool entered = false; QObject observer;
+    QObject::connect(f.client.get(), &VoiceClient::changed, &observer, [&] {
+        if (entered) return;
+        entered = true;
+        f.send(message); f.peer->flush();
+        require(wait_until([&] { return !f.client->busy(); }), "cancel notification reenters and receives committed music candidate");
+        f.client->startText("下一任务");
+    });
+    f.client->cancel();
+    require(entered && backend->calls.size() == 1 && f.client->status() == "创建任务",
+            "cancel is visible before reentrant final and does not cancel the newly started work");
+    f.setup(f.take(), "reentrant-new-work"); const auto next = f.take();
+    require(next.envelope.topic == "cockpit.text.input", "old cancel cannot turn new Setup into Exit");
+    f.cancelled(next, false, false, false);
+    require(wait_until([&] { return !f.client->busy(); }), "reentrant next task completes independently");
+}
 }  // namespace
 int main(int argc, char** argv) {
     QGuiApplication app(argc, argv);
     try {
-        if (argc == 5 && QString(argv[1]) == "--cases") {
+        if (argc == 3 && QString(argv[1]) == "--preview") {
+            cockpit_preview(QString(argv[2]));
+        } else if (argc == 5 && QString(argv[1]) == "--cases") {
             bool ok = false; const auto port = QString(argv[2]).toUShort(&ok); require(ok && port, "cases probe port");
             return cases_probe(port, QString(argv[3]), QString(argv[4]));
         } else if (argc >= 3 && QString(argv[1]) == "--live") {
@@ -587,10 +694,12 @@ int main(int argc, char** argv) {
             bool ok = false; const auto port = QString(argv[2]).toUShort(&ok); require(ok && port, "shutdown probe port");
             shutdown_probe(port);
         } else {
-            require(argc == 1, "usage: --cases PORT CASES_JSON NEW_OUTPUT_DIR | --live PORT [WAV [OUTPUT_DIR]] | --shutdown PORT");
+            require(argc == 1, "usage: --preview NEW_OUTPUT_DIR | --cases PORT CASES_JSON NEW_OUTPUT_DIR | --live PORT [WAV [OUTPUT_DIR]] | --shutdown PORT");
             setup_cancel_and_close(); cancel_then_admission_rejection(); task_result_before_exit_and_responsive();
             invalid_cleanup_and_disconnect(); qml_window(); vehicle_receipt_contract(); answer_audio_path_contract();
             cockpit_scene_contract(); invalid_vehicle_result_never_updates_view();
+            music_terminal_contract();
+            reentrant_music_cancel_contract();
         }
         std::cout << "voice_client_test passed (human listening not verified)\n"; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

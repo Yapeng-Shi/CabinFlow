@@ -3,6 +3,7 @@ syntax = "proto3";
 package cabinflow.agent.v1;
 
 import "cockpit_audio.proto";
+import "cockpit_text.proto";
 
 message TaskFailure {
   string message = 1;
@@ -32,6 +33,7 @@ message VoiceTaskResult {
     AudioOutput audio = 4;
     TaskFailure failed = 5;
     TaskCancelled cancelled = 6;
+    MusicCommand music_command = 8;
   }
 
   VehicleResult vehicle = 7;

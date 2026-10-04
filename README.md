@@ -25,6 +25,11 @@ to Agent components. Models can evolve without rebuilding the entire application
 > and left-front-window control are explicitly simulated by FakeVehicle, never sent
 > to a real vehicle. A 2.5D driver view visualizes validated execution receipts.
 
+> 🎵 The front-row panorama now includes a music HMI and typed voice commands.
+> **NetEase playback is not enabled:** official developer authorization and CLI/player
+> qualification remain pending. Voice inference stays local; online music is a separate
+> network boundary. [Music milestone and limits](agent/docs/cockpit-music-20261004.md).
+
 ## 💡 Why CabinFlow?
 
 A voice assistant needs more than model calls: it must connect stages, correlate
@@ -85,7 +90,7 @@ in one process and uses Runtime-managed execution channels.
 
 - **Implemented:** generic Runtime, typed TCP control/data paths, injected inference adapters, reusable `VoicePipeline`, a one-screen Qt client, and a 2.5D cockpit with FakeVehicle climate and left-front-window receipts.
 - **Executed:** real text/WAV inputs through TCP and Runtime nodes; 15 fixed Qt trials archived answer WAVs/screenshots and observed playback-start/cancel-stop states.
-- **Next:** hands-on listening, an operation video and diagnosis of the current Qt/audio LeakSanitizer finding. [Fixed CLI/Qt cases](agent/docs/voice-demo-acceptance-20261003.md) still fail speech-quality expectations.
+- **Current extension:** panoramic QML cockpit and typed music control contracts; production music remains disabled pending official authorization and qualification. Hands-on listening, an operation video and the Qt/audio LeakSanitizer finding remain open. [Fixed CLI/Qt cases](agent/docs/voice-demo-acceptance-20261003.md) still fail speech-quality expectations.
 - **Not claimed:** complete voice UX, overall model accuracy, production vehicle control, AAOS integration or physical RK3576 deployment.
 
 The app supports one active task and non-streaming output. Qt provides cancellation

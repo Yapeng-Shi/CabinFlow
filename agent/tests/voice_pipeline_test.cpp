@@ -698,6 +698,32 @@ void vehicle_cancellation_contract(bool after_action) {
 }
 }
 
+void music_routing_contract() {
+    Evidence evidence;
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestLlm>(evidence),
+                           std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(false, false));
+    using Command = cabinflow::agent::v1::MusicCommand;
+    const std::pair<const char*, Command::Action> commands[] = {
+        {"搜索周杰伦", Command::SEARCH}, {"播放音乐", Command::PLAY}, {"暂停音乐", Command::PAUSE},
+        {"上一首", Command::PREVIOUS}, {"下一首", Command::NEXT}, {"播放第一首", Command::SELECT},
+        {"播放第二首", Command::SELECT}, {"播放第11首", Command::SELECT}};
+    for (const auto& [text, action] : commands) {
+        const auto result = pipeline.run_text(text);
+        require(result.status == VoiceStatus::kCompleted && result.music_command && result.music_command->action() == action &&
+            result.audio.bytes.empty() && result.answer.empty(), "music produces typed instruction, not speech or playback receipt");
+        require(result.vehicle && !result.vehicle->action_applied && !result.vehicle->climate_on &&
+            !result.vehicle->left_front_window_open, "music cannot mutate fake vehicle state");
+    }
+    const auto search = pipeline.run_text("搜索  周杰伦  ");
+    require(search.music_command && search.music_command->keyword() == "周杰伦", "search keyword explicitly trimmed");
+    for (const auto* invalid : {"搜索", "播放第0首", "播放第abc首"})
+        require(pipeline.run_text(invalid).status == VoiceStatus::kFailed, "recognized invalid music format fails explicitly, not LLM fallback");
+    evidence.asr_transcript = "暂停音乐";
+    const auto audio = pipeline.run_wav({"test-input"});
+    require(audio.music_command && audio.music_command->action() == Command::PAUSE && evidence.asr_calls == 1 &&
+        evidence.llm_calls == 0 && evidence.tts_calls == 0, "ASR and text share one Router; music bypasses LLM/TTS");
+}
+
 int main() {
     try {
         text_and_failure_contract();
@@ -718,6 +744,7 @@ int main() {
         window_routing_and_failure_contract();
         window_cancellation_contract(false);
         window_cancellation_contract(true);
+        music_routing_contract();
         std::cout << "voice pipeline contracts passed; test backends are not real inference\n";
         return 0;
     } catch (const std::exception& error) {

@@ -6,6 +6,22 @@ message TextInput {
   string text = 1;
 }
 
+// 只表示识别出的音乐指令，不代表播放器已经执行或播放成功。
+message MusicCommand {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    SEARCH = 1;
+    PLAY = 2;
+    PAUSE = 3;
+    PREVIOUS = 4;
+    NEXT = 5;
+    SELECT = 6;
+  }
+  Action action = 1;
+  string keyword = 2;
+  uint32 result_index = 3; // 搜索结果的一基编号；只有 SELECT 使用。
+}
+
 enum CockpitIntent {
   COCKPIT_INTENT_UNRECOGNIZED = 0;
   COCKPIT_INTENT_CLIMATE_ON = 1;
@@ -14,10 +30,12 @@ enum CockpitIntent {
   COCKPIT_INTENT_SEAT_HEATING_OFF = 4;
   COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN = 5;
   COCKPIT_INTENT_LEFT_FRONT_WINDOW_CLOSE = 6;
+  COCKPIT_INTENT_MUSIC = 7;
 }
 
 message TextOutput {
   string request_message_id = 1;
   CockpitIntent intent = 2;
   string text = 3;
+  MusicCommand music_command = 4;
 }

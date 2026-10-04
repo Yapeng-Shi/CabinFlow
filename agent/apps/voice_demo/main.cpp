@@ -53,11 +53,20 @@ int main(int argc, char** argv) {
                    << "\naction_applied=" << result.vehicle->action_applied
                    << "\nleft_front_window_open=" << result.vehicle->left_front_window_open << '\n';
         } else report << "vehicle_state=unknown\n";
+        if (result.music_command) report << "music_action=" << result.music_command->action()
+            << "\nmusic_keyword=" << result.music_command->keyword()
+            << "\nmusic_result_index=" << result.music_command->result_index()
+            << "\nmusic_execution=not_executed_by_cli_diagnostic\n";
         report.close();
         if (!report) throw std::runtime_error("cannot write result report");
         if (result.status != cabinflow::agent::VoiceStatus::kCompleted) {
             std::cerr << "task failed: " << result.detail << '\n';
             return 1;
+        }
+        if (result.music_command) {
+            std::cout << "transcript=" << result.transcript
+                      << "\nmusic_command=recognized music_execution=not_executed_by_cli_diagnostic\n";
+            return 0;
         }
         std::ofstream audio(output / "answer.wav", std::ios::binary);
         audio.write(result.audio.bytes.data(), static_cast<std::streamsize>(result.audio.bytes.size()));

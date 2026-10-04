@@ -545,7 +545,11 @@ void test_rule_based_intents() {
                     output.ParseFromString(message.payload) &&
                     output.request_message_id() == "intent-final" &&
                     output.intent() == expected &&
-                    output.text().find("未执行车控") != std::string::npos,
+                    (expected == cabinflow::agent::v1::COCKPIT_INTENT_MUSIC ?
+                        (output.has_music_command() && output.music_command().action() == cabinflow::agent::v1::MusicCommand::PLAY &&
+                         output.music_command().keyword().empty() && output.music_command().result_index() == 0 &&
+                         output.text().find("尚未执行") != std::string::npos) :
+                        (!output.has_music_command() && output.text().find("未执行车控") != std::string::npos)),
                 "rule-based output identifies only the stated cockpit intent");
         expect_no_response(client.get());
     };
@@ -555,7 +559,8 @@ void test_rule_based_intents() {
              cabinflow::agent::v1::COCKPIT_INTENT_SEAT_HEATING_ON);
     run_case("关闭座椅加热",
              cabinflow::agent::v1::COCKPIT_INTENT_SEAT_HEATING_OFF);
-    run_case("播放音乐", cabinflow::agent::v1::COCKPIT_INTENT_UNRECOGNIZED);
+    run_case("打开天窗", cabinflow::agent::v1::COCKPIT_INTENT_UNRECOGNIZED);
+    run_case("播放音乐", cabinflow::agent::v1::COCKPIT_INTENT_MUSIC);
 }
 
 void test_exit_rejects_later_data_without_cancelling_other_work() {

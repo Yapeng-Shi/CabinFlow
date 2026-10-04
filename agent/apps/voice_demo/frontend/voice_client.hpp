@@ -12,6 +12,7 @@
 #include <QUrl>
 
 #include <cabinflow/gateway/runtime_message_framer.hpp>
+#include "music_controller.hpp"
 
 class VoiceClient final : public QObject {
     Q_OBJECT
@@ -29,7 +30,7 @@ class VoiceClient final : public QObject {
     Q_PROPERTY(bool climateOn READ climateOn NOTIFY changed)
     Q_PROPERTY(bool leftFrontWindowOpen READ leftFrontWindowOpen NOTIFY changed)
 public:
-    VoiceClient(QString host, quint16 port, QObject* parent = nullptr);
+    VoiceClient(QString host, quint16 port, MusicController& music, QObject* parent = nullptr);
     ~VoiceClient() override;
     QString status() const { return status_; }
     QString transcript() const { return transcript_; }
@@ -74,9 +75,11 @@ private:
     void fail(QString detail, bool disconnect = false);
     void terminal(QString state);
     void clearAudio();
+    void maybeClose();
 
     QString host_;
     quint16 port_;
+    MusicController& music_;
     QTcpSocket socket_;
     cabinflow::gateway::RuntimeMessageFramer framer_;
     QAudioOutput audio_output_;
@@ -88,6 +91,8 @@ private:
     QString status_{"未连接"}, transcript_, answer_, error_;
     bool audio_input_{false}, busy_{false}, input_sent_{false};
     bool cancel_requested_{false}, closing_{false}, cleanup_rejection_{false};
+    bool terminal_consumed_{false}, answer_pending_{false}, clearing_audio_{false};
+    quint64 answer_generation_{0};
     // 未收到可信业务回执时不把 Protobuf 的 false 默认值当作实际“关”。
     bool vehicle_known_{false}, climate_on_{false};
     bool left_front_window_open_{false};

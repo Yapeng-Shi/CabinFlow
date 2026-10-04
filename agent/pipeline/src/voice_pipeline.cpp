@@ -17,6 +17,7 @@
 #include <control.pb.h>
 
 #include <cabinflow/agent/dialogue_text_node.hpp>
+#include <cabinflow/agent/music_command.hpp>
 #include <cabinflow/gateway/control_envelope_validator.hpp>
 #include <cabinflow/gateway/control_service.hpp>
 #include <cabinflow/protocol/message_codec.hpp>
@@ -256,6 +257,16 @@ struct VoicePipeline::State {
             if (!stage) return fail(stage);
             v1::TextOutput routed;
             if (!routed.ParseFromString(stage.value)) return fail({{}, BackendError::kInferenceFailed, "invalid_router_output"});
+            if (routed.intent() == v1::COCKPIT_INTENT_MUSIC) {
+                if (!routed.has_music_command() || !is_valid_music_command(routed.music_command()))
+                    return fail({{}, BackendError::kInvalidInput, "invalid_music_command"});
+                if (cancelled()) return fail(cancelled_result());
+                // 这里只交接指令；Qt 才拥有在线播放器，不调用 LLM/TTS，也不冒充已播放。
+                result.music_command = routed.music_command();
+                result.status = VoiceStatus::kCompleted;
+                owner_.store_candidate(std::move(result));
+                return MessageHandlingResult::kHandled;
+            }
             if (routed.intent() == v1::COCKPIT_INTENT_UNRECOGNIZED) {
                 stage = owner_.deliver(make("cockpit.llm.input", "llm.primary", text.SerializeAsString()));
                 if (!stage) return fail(stage);
@@ -462,8 +473,11 @@ struct VoicePipeline::State {
         wire.topic = "cockpit.task.result";
         if (result.status == VoiceStatus::kCompleted) {
             output.set_answer(result.answer);
-            output.mutable_audio()->set_request_message_id(result.request_message_id);
-            output.mutable_audio()->set_wav_bytes(std::move(result.audio.bytes));
+            if (result.music_command) *output.mutable_music_command() = *result.music_command;
+            else {
+                output.mutable_audio()->set_request_message_id(result.request_message_id);
+                output.mutable_audio()->set_wav_bytes(std::move(result.audio.bytes));
+            }
         } else if (result.status == VoiceStatus::kCancelled) {
             output.mutable_cancelled()->set_reason(result.detail);
             wire.kind = protocol::MessageKind::kError;
@@ -602,6 +616,10 @@ VoiceResult VoicePipeline::run(bool audio_input, std::string input) {
                                         terminal.vehicle().action_applied(), terminal.vehicle().left_front_window_open()};
         result.transcript = terminal.transcript();
         if (terminal.has_audio()) { result.status = VoiceStatus::kCompleted; result.answer = terminal.answer(); result.audio.bytes = terminal.audio().wav_bytes(); }
+        else if (terminal.has_music_command() && is_valid_music_command(terminal.music_command())) {
+            result.status = VoiceStatus::kCompleted;
+            result.music_command = terminal.music_command();
+        }
         else if (terminal.has_cancelled()) { result.status = VoiceStatus::kCancelled; result.detail = terminal.cancelled().reason(); }
         else if (terminal.has_failed()) result.detail = terminal.failed().message();
         else throw std::runtime_error("final_task_result_missing_outcome");

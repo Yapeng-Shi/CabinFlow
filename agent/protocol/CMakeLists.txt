@@ -16,6 +16,7 @@ add_library(CabinFlow::AgentProtocol ALIAS cabinflow_agent_protocol)
 target_include_directories(cabinflow_agent_protocol
     PUBLIC
         ${CMAKE_CURRENT_BINARY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 target_link_libraries(cabinflow_agent_protocol PUBLIC protobuf::libprotobuf)
