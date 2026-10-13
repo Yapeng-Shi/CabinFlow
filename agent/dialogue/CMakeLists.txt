@@ -1,5 +1,6 @@
 add_library(cabinflow_dialogue_text_node
     src/dialogue_text_node.cpp
+    src/query_router.cpp
 )
 add_library(CabinFlow::DialogueTextNode ALIAS cabinflow_dialogue_text_node)
 

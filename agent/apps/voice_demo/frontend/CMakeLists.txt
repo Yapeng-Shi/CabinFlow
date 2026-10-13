@@ -1,12 +1,40 @@
 find_package(Qt6 6.4 REQUIRED COMPONENTS Quick Network Multimedia)
-set(VOICE_UI_CONTROL_SOURCES voice_client.cpp voice_client.hpp music_controller.cpp music_controller.hpp music_backend.hpp)
-add_executable(voice_demo_ui main.cpp ${VOICE_UI_CONTROL_SOURCES})
+set(VOICE_UI_CONTROL_SOURCES voice_client.cpp voice_client.hpp grpc_client.cpp grpc_client.hpp music_controller.cpp music_controller.hpp music_backend.hpp wake_input.hpp)
+add_library(cabinflow_wake_engine STATIC wake_engine.cpp wake_engine.hpp)
+target_include_directories(cabinflow_wake_engine PRIVATE
+    "${CABINFLOW_INFERENCE_DIR}/sherpa-onnx-v1.11.3-linux-x64-shared/include")
+target_link_libraries(cabinflow_wake_engine PRIVATE cabinflow_audio_codec
+    Qt6::Core
+    "${CABINFLOW_INFERENCE_DIR}/sherpa-onnx-v1.11.3-linux-x64-shared/lib/libsherpa-onnx-c-api.so")
+cabinflow_enable_compiler_warnings(cabinflow_wake_engine)
+target_compile_definitions(cabinflow_wake_engine PRIVATE
+    CABINFLOW_WAKE_MANIFEST="${CABINFLOW_REPO_DIR}/agent/models/wake-models.sha256")
+add_executable(voice_demo_ui main.cpp wake_microphone.cpp wake_microphone.hpp ${VOICE_UI_CONTROL_SOURCES})
 set_target_properties(voice_demo_ui PROPERTIES AUTOMOC ON)
 qt_add_resources(voice_demo_ui "voice_demo_qml" PREFIX "/" FILES Main.qml CockpitScene.qml)
 target_link_libraries(voice_demo_ui PRIVATE Qt6::Quick Qt6::Network Qt6::Multimedia
-    CabinFlow::Gateway CabinFlow::AgentProtocol)
+    CabinFlow::Gateway CabinFlow::AgentProtocol cabinflow_wake_engine)
 cabinflow_enable_compiler_warnings(voice_demo_ui)
 if(BUILD_TESTING)
+    add_executable(pcm_frame_buffer_test ${CABINFLOW_REPO_DIR}/agent/tests/pcm_frame_buffer_test.cpp)
+    target_include_directories(pcm_frame_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    cabinflow_enable_compiler_warnings(pcm_frame_buffer_test)
+    add_test(NAME pcm_frame_buffer_test COMMAND pcm_frame_buffer_test)
+    add_executable(wake_microphone_test ${CABINFLOW_REPO_DIR}/agent/tests/wake_microphone_test.cpp
+        wake_microphone.cpp wake_microphone.hpp wake_input.hpp)
+    set_target_properties(wake_microphone_test PROPERTIES AUTOMOC ON)
+    target_include_directories(wake_microphone_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(wake_microphone_test PRIVATE
+        CABINFLOW_WAKE_TEST_MANIFEST="${CABINFLOW_REPO_DIR}/agent/models/wake-models.sha256"
+        CABINFLOW_WAKE_TEST_MODELS="${CABINFLOW_REPO_DIR}/runtime/build/models/wake")
+    target_link_libraries(wake_microphone_test PRIVATE Qt6::Quick Qt6::Multimedia cabinflow_wake_engine)
+    cabinflow_enable_compiler_warnings(wake_microphone_test)
+    add_test(NAME wake_microphone_test COMMAND wake_microphone_test)
+    set_tests_properties(wake_microphone_test PROPERTIES TIMEOUT 10 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    add_executable(wake_engine_test ${CABINFLOW_REPO_DIR}/agent/tests/wake_engine_test.cpp)
+    target_include_directories(wake_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wake_engine_test PRIVATE cabinflow_wake_engine cabinflow_audio_codec)
+    cabinflow_enable_compiler_warnings(wake_engine_test)
     add_executable(voice_client_test ${CABINFLOW_REPO_DIR}/agent/tests/voice_client_test.cpp ${VOICE_UI_CONTROL_SOURCES})
     set_target_properties(voice_client_test PROPERTIES AUTOMOC ON)
     target_include_directories(voice_client_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

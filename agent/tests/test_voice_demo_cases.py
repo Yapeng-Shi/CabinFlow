@@ -73,6 +73,16 @@ class VoiceDemoCasesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "required left_front_window_open"):
                 runner.parse_result(path)
 
+    def test_unknown_can_receipt_does_not_become_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.txt"
+            path.write_text("status=1\ntranscript=打开空调\nanswer=\nerror=CAN timeout\nsemantic_quality=not_automatically_verified\nvehicle_simulated=1\nclimate_on=unknown\naction_applied=unknown\nleft_front_window_open=unknown\n", encoding="utf-8")
+            receipt = runner.parse_result(path)["vehicle"]
+            self.assertTrue(receipt["simulated"])
+            self.assertIsNone(receipt["climate_on"])
+            self.assertIsNone(receipt["action_applied"])
+            self.assertIsNone(receipt["left_front_window_open"])
+
     def test_resource_fields_are_not_silently_defaulted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "resources.txt"

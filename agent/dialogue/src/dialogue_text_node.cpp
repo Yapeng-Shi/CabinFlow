@@ -1,7 +1,9 @@
 #include <cabinflow/agent/dialogue_text_node.hpp>
+#include "query_router.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <charconv>
 #include <optional>
 #include <string>
@@ -68,10 +70,11 @@ constexpr std::size_t kMaxTextBytes = 16U * 1024U;
 
 [[nodiscard]] std::pair<v1::CockpitIntent, std::string_view> recognize_intent(
     std::string_view text) noexcept {
-    if (text == "打开空调") {
+    // 只补原验收语料的完整表达；不删除“请”或按子串匹配，避免误执行否定/问句。
+    if (text == "打开空调" || text == "请打开空调" || text == "请打开空调。") {
         return {v1::COCKPIT_INTENT_CLIMATE_ON, "识别到打开空调意图，未执行车控。"};
     }
-    if (text == "关闭空调") {
+    if (text == "关闭空调" || text == "请关闭空调" || text == "请关闭空调。") {
         return {v1::COCKPIT_INTENT_CLIMATE_OFF, "识别到关闭空调意图，未执行车控。"};
     }
     if (text == "打开左前车窗") {
@@ -167,49 +170,58 @@ runtime::MessageHandlingResult DialogueTextNode::on_message(
 
 runtime::MessageHandlingResult DialogueTextNode::on_text_input(
     const protocol::MessageEnvelope& envelope, std::string_view text) noexcept {
-    if (context_ == nullptr) {
-        return runtime::MessageHandlingResult::kInvalidPayload;
-    }
+    try {
+        if (context_ == nullptr) {
+            return runtime::MessageHandlingResult::kInvalidPayload;
+        }
 
-    // 不记录原始座舱文本，避免最小运行时路径把用户内容扩散到日志。
-    context_->logger().log(observability::Event{
-        "dialogue", "text_input_received", envelope.trace_id, envelope.session_id,
-        envelope.work_id, envelope.message_id,
-        "text_bytes=" + std::to_string(text.size())});
-
-    const auto key = std::make_pair(envelope.session_id, envelope.work_id);
-    auto [found, inserted] = buffered_inputs_.try_emplace(key);
-    static_cast<void>(inserted);
-    if (found->second.size() + text.size() > kMaxTextBytes) {
-        buffered_inputs_.erase(found);
-        return runtime::MessageHandlingResult::kInvalidPayload;
-    }
-    found->second.append(text);
-    if (!envelope.is_final) {
-        return runtime::MessageHandlingResult::kHandled;
-    }
-
-    // 分片属于同一 work 的输入流；只在 final 到达时识别一次并回传原请求连接。
-    const auto music = recognize_music(found->second);
-    const auto [intent, reply] = recognize_intent(found->second);
-    buffered_inputs_.erase(found);
-    v1::TextOutput output;
-    output.set_request_message_id(envelope.message_id);
-    output.set_intent(intent);
-    output.set_text(std::string(reply));
-    if (music) {
-        output.set_intent(v1::COCKPIT_INTENT_MUSIC);
-        *output.mutable_music_command() = *music;
-        output.set_text("音乐指令已识别，尚未执行播放器操作。");
-    }
-    std::string payload;
-    if (!output.SerializeToString(&payload) ||
-        !output_handler_(envelope, "cockpit.text.output", std::move(payload))) {
+        // 不记录原始座舱文本，避免最小运行时路径把用户内容扩散到日志。
         context_->logger().log(observability::Event{
-            "dialogue", "text_output_not_delivered", envelope.trace_id,
-            envelope.session_id, envelope.work_id, envelope.message_id, ""});
+            "dialogue", "text_input_received", envelope.trace_id, envelope.session_id,
+            envelope.work_id, envelope.message_id,
+            "text_bytes=" + std::to_string(text.size())});
+
+        const auto key = std::make_pair(envelope.session_id, envelope.work_id);
+        auto [found, inserted] = buffered_inputs_.try_emplace(key);
+        static_cast<void>(inserted);
+        if (found->second.size() + text.size() > kMaxTextBytes) {
+            buffered_inputs_.erase(found);
+            return runtime::MessageHandlingResult::kInvalidPayload;
+        }
+        found->second.append(text);
+        if (!envelope.is_final) {
+            return runtime::MessageHandlingResult::kHandled;
+        }
+
+        // 分片属于同一 work 的输入流；只在 final 到达时识别一次并回传原请求连接。
+        const auto music = recognize_music(found->second);
+        const auto [intent, reply] = recognize_intent(found->second);
+        const auto answer_route = !music && intent == v1::COCKPIT_INTENT_UNRECOGNIZED
+            ? classify_answer_route(found->second) : v1::ANSWER_ROUTE_UNSPECIFIED;
+        buffered_inputs_.erase(found);
+        v1::TextOutput output;
+        output.set_request_message_id(envelope.message_id);
+        output.set_intent(intent);
+        output.set_text(std::string(reply));
+        output.set_answer_route(answer_route);
+        if (music) {
+            output.set_intent(v1::COCKPIT_INTENT_MUSIC);
+            *output.mutable_music_command() = *music;
+            output.set_text("音乐指令已识别，尚未执行播放器操作。");
+        }
+        std::string payload;
+        if (!output.SerializeToString(&payload) ||
+            !output_handler_(envelope, "cockpit.text.output", std::move(payload))) {
+            context_->logger().log(observability::Event{
+                "dialogue", "text_output_not_delivered", envelope.trace_id,
+                envelope.session_id, envelope.work_id, envelope.message_id, ""});
+        }
+        return runtime::MessageHandlingResult::kHandled;
+    } catch (const std::exception&) {
+        // 分级器和缓冲分配也在 noexcept 边界内；失败不能伪装成普通问答。
+        buffered_inputs_.erase(std::make_pair(envelope.session_id, envelope.work_id));
+        return runtime::MessageHandlingResult::kInvalidPayload;
     }
-    return runtime::MessageHandlingResult::kHandled;
 }
 
 }  // namespace cabinflow::agent

@@ -1,14 +1,19 @@
 #include <cabinflow/agent/voice_pipeline.hpp>
+#include <cabinflow/agent/fake_vehicle.hpp>
 #include <cabinflow/runtime/clock.hpp>
 #include <cabinflow/runtime/unit_registry.hpp>
 
 #include <cockpit_task.pb.h>
 #include <cockpit_text.pb.h>
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -22,7 +27,9 @@ void require(bool condition, const char* message) {
 }
 
 struct Evidence {
-    std::atomic<int> asr_calls{0}, llm_calls{0}, tts_calls{0};
+    std::atomic<int> asr_calls{0}, rag_calls{0}, llm_calls{0}, tts_calls{0};
+    bool block_rag{false}, fail_rag{false}, throw_rag{false};
+    std::optional<RagDocument> rag_match;
     std::string llm_input, tts_input;
     bool fail_llm{false};
     bool block_asr{false};
@@ -50,6 +57,25 @@ public:
             evidence_.changed.wait(lock, [this] { return evidence_.released; });
         }
         return {evidence_.asr_transcript, BackendError::kNone, {}};
+    }
+private:
+    Evidence& evidence_;
+};
+
+class TestRag final : public RagBackend {
+public:
+    explicit TestRag(Evidence& evidence) : evidence_(evidence) {}
+    BackendResult<RagSearchResult> search(std::string_view, const CancellationCheck&) override {
+        ++evidence_.rag_calls;
+        if (evidence_.block_rag) {
+            std::unique_lock<std::mutex> lock(evidence_.mutex);
+            evidence_.entered = true;
+            evidence_.changed.notify_all();
+            evidence_.changed.wait(lock, [this] { return evidence_.released; });
+        }
+        if (evidence_.throw_rag) throw std::runtime_error("injected_rag_exception");
+        if (evidence_.fail_rag) return {{}, BackendError::kInferenceFailed, "injected_rag_failure"};
+        return {{evidence_.rag_match}, BackendError::kNone, {}};
     }
 private:
     Evidence& evidence_;
@@ -102,7 +128,7 @@ private:
 
 void text_and_failure_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     auto first = pipeline.run_text("法国的首都是什么");
@@ -121,7 +147,7 @@ void text_and_failure_contract() {
     evidence.fail_llm = false;
     auto intent = pipeline.run_text("打开空调");
     require(intent.status == VoiceStatus::kCompleted && intent.answer == "模拟空调已打开。" &&
-                intent.vehicle && intent.vehicle->simulated && intent.vehicle->climate_on && intent.vehicle->action_applied,
+                intent.vehicle && intent.vehicle->simulated && intent.vehicle->climate_on == true && intent.vehicle->action_applied == true,
             "explicit climate intent reports actual FakeVehicle execution");
     require(evidence.llm_calls == 2, "recognized intent does not ask LLM to invent execution");
     auto audio = pipeline.run_wav({"test-input-not-real-wav"});
@@ -136,7 +162,7 @@ void cancellation_contract(bool during_tts) {
     Evidence evidence;
     evidence.block_llm = !during_tts;
     evidence.block_tts = during_tts;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     VoiceResult result;
@@ -171,7 +197,7 @@ void cancellation_contract(bool during_tts) {
 
 void frame_boundary_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     // 字节体本身尚未到上限，但加入 Protobuf 字段和 Envelope 后必定超限。
@@ -279,7 +305,7 @@ bool wait_completion(const RootCompletionGate& gate, bool before_commit = false)
 
 void candidate_commit_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     v1::TextInput climate;
@@ -318,7 +344,7 @@ void candidate_commit_contract() {
 
 void root_not_handled_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     for (const auto failure : {cabinflow::runtime::Runtime::TargetDeliveryFailure::kWorkCancelled,
@@ -375,7 +401,7 @@ void root_not_handled_contract() {
 
 void invalid_business_and_rollback_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     auto root = make_root(pipeline, "invalid-business", std::string("\xff", 1));
@@ -407,7 +433,7 @@ void invalid_business_and_rollback_contract() {
 
 void concurrent_exit_and_completion_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     for (int attempt = 0; attempt < 32; ++attempt) {
@@ -447,7 +473,7 @@ void concurrent_exit_and_completion_contract() {
 
 void gate_exception_cleanup_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     const auto root = make_root(pipeline, "gate-exception", question_payload());
@@ -473,7 +499,7 @@ void gate_exception_cleanup_contract() {
 void shutdown_waits_for_downstream_contract() {
     Evidence evidence;
     evidence.block_llm = true;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     VoiceResult result;
@@ -520,25 +546,29 @@ void require_vehicle(const VoiceResult& result, bool climate_on, bool action_app
 
 void fake_vehicle_set_contract() {
     FakeVehicle vehicle(false, false);
-    require(!vehicle.climate_on(), "FakeVehicle initialOff is explicit");
-    require(vehicle.set_climate(true) && vehicle.set_climate(true) && vehicle.climate_on(),
-            "repeated climate-on sets state and never toggles it");
-    require(!vehicle.set_climate(false) && !vehicle.set_climate(false) && !vehicle.climate_on(),
-            "repeated climate-off sets state and returns actual state");
+    require(vehicle.snapshot().climate_on == false, "FakeVehicle initialOff is explicit");
+    require(vehicle.set_climate(true).climate_on == true && vehicle.set_climate(true).climate_on == true &&
+            vehicle.snapshot().climate_on == true, "repeated climate-on sets state and never toggles it");
+    require(vehicle.set_climate(false).climate_on == false && vehicle.set_climate(false).climate_on == false &&
+            vehicle.snapshot().climate_on == false, "repeated climate-off sets state and returns actual state");
     FakeVehicle initial_on(true, false);
-    require(initial_on.climate_on(), "constructor honours explicit initial state");
-    require(!initial_on.left_front_window_open(), "window initialClosed is explicit, independent of climate");
-    require(initial_on.set_left_front_window(true) && initial_on.set_left_front_window(true) && initial_on.climate_on(),
+    require(initial_on.snapshot().climate_on == true, "constructor honours explicit initial state");
+    require(initial_on.snapshot().left_front_window_open == false, "window initialClosed is explicit, independent of climate");
+    require(initial_on.set_left_front_window(true).left_front_window_open == true &&
+            initial_on.set_left_front_window(true).left_front_window_open == true && initial_on.snapshot().climate_on == true,
             "repeated window-open sets state and does not change AC");
-    require(!initial_on.set_climate(false) && initial_on.left_front_window_open(), "climate set does not close window");
-    require(!initial_on.set_left_front_window(false) && !initial_on.set_left_front_window(false), "repeated window-close never toggles");
+    require(initial_on.set_climate(false).climate_on == false && initial_on.snapshot().left_front_window_open == true,
+            "climate set does not close window");
+    require(initial_on.set_left_front_window(false).left_front_window_open == false &&
+            initial_on.set_left_front_window(false).left_front_window_open == false, "repeated window-close never toggles");
     FakeVehicle initially_open(false, true);
-    require(initially_open.left_front_window_open() && !initially_open.climate_on(), "constructor accepts explicit window initialOpen");
+    require(initially_open.snapshot().left_front_window_open == true && initially_open.snapshot().climate_on == false,
+            "constructor accepts explicit window initialOpen");
 }
 
 void vehicle_routing_and_failure_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     const auto first = pipeline.run_text("打开空调");
@@ -589,7 +619,7 @@ void vehicle_routing_and_failure_contract() {
 void vehicle_initial_state_failure_contract() {
     Evidence evidence;
     evidence.fail_llm = true;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(true, false));
     const auto failed = pipeline.run_text("一般问题");
@@ -605,7 +635,7 @@ void vehicle_initial_state_failure_contract() {
 
 void window_routing_and_failure_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestLlm>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence), std::make_unique<TestLlm>(evidence),
                            std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(true, false));
     for (int index = 0; index < 4; ++index) {
         const bool open = index < 2;
@@ -638,7 +668,7 @@ void window_routing_and_failure_contract() {
 void window_cancellation_contract(bool after_action) {
     Evidence evidence; evidence.block_asr = !after_action;
     evidence.asr_transcript = "打开左前车窗"; evidence.block_tts = after_action;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestLlm>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence), std::make_unique<TestLlm>(evidence),
                            std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(true, false));
     VoiceResult result; std::atomic<bool> returned{false};
     std::thread runner([&] { result = after_action ? pipeline.run_text("打开左前车窗") : pipeline.run_wav({"test-input"}); returned = true; });
@@ -662,7 +692,7 @@ void vehicle_cancellation_contract(bool after_action) {
     evidence.block_asr = !after_action;
     evidence.asr_transcript = "打开空调";
     evidence.block_tts = after_action;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
                            std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence),
                            std::make_unique<FakeVehicle>(false, false));
     VoiceResult result;
@@ -698,9 +728,76 @@ void vehicle_cancellation_contract(bool after_action) {
 }
 }
 
+void registered_climate_command_contract() {
+    std::ifstream input_file(CABINFLOW_REGISTERED_INPUTS);
+    require(input_file.is_open(), "registered speech inputs must exist");
+    const std::string content((std::istreambuf_iterator<char>(input_file)), {});
+    google::protobuf::Struct inputs;
+    require(!input_file.bad() && google::protobuf::util::JsonStringToMessage(content, &inputs).ok(),
+            "registered speech inputs must be valid JSON metadata");
+    Evidence evidence;
+    evidence.fail_rag = true;
+    evidence.fail_llm = true;
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
+        std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(false, false));
+    unsigned climate_cases = 0;
+    bool seen_on = false, seen_off = false;
+    require(inputs.fields().at("cases").kind_case() == google::protobuf::Value::kListValue,
+            "registered cases must be a list");
+    // 从原始语料读取期望输入，防止测试另抄一份“能通过”的句子而再次漏掉合同错配。
+    for (const auto& entry : inputs.fields().at("cases").list_value().values()) {
+        const auto& fields = entry.struct_value().fields();
+        require(fields.at("id").kind_case() == google::protobuf::Value::kStringValue,
+                "registered case id must be a string");
+        const auto& id = fields.at("id").string_value();
+        if (id != "ac_on" && id != "ac_off") continue;
+        const bool on = id == "ac_on";
+        auto& seen = on ? seen_on : seen_off;
+        require(!seen, "registered climate case ids must not be duplicated");
+        seen = true;
+        for (const auto* key : {"reference_text", "text"}) {
+            require(fields.at(key).kind_case() == google::protobuf::Value::kStringValue,
+                    "registered command fields must be strings");
+            const auto& value = fields.at(key).string_value();
+            require(!value.empty(), "registered command input must not be empty");
+            const auto before_asr = evidence.asr_calls.load();
+            const auto result = pipeline.run_text(value);
+            require(result.status == VoiceStatus::kCompleted && result.transcript == value && result.vehicle &&
+                result.vehicle->simulated && result.vehicle->climate_on == on && result.vehicle->action_applied == true &&
+                result.vehicle->left_front_window_open == false && !result.audio.bytes.empty(),
+                "registered climate text produces the actual set receipt, preserving original input");
+            require(evidence.asr_calls == before_asr && evidence.rag_calls == 0 && evidence.llm_calls == 0,
+                "registered text command bypasses ASR/RAG/LLM, not an inferred vehicle action");
+        }
+        evidence.asr_transcript = fields.at("reference_text").string_value();
+        const auto audio = pipeline.run_wav({"explicit-test-input-not-real-wav"});
+        require(audio.status == VoiceStatus::kCompleted && audio.transcript == evidence.asr_transcript && audio.vehicle &&
+            audio.vehicle->climate_on == on && audio.vehicle->action_applied == true && !audio.audio.bytes.empty() &&
+            evidence.rag_calls == 0 && evidence.llm_calls == 0, "perfect-ASR test transcript shares the same command rule");
+        ++climate_cases;
+    }
+    require(climate_cases == 2 && seen_on && seen_off && evidence.asr_calls == 2 && evidence.tts_calls == 6,
+            "both registered climate cases and all text/WAV-adapter variants are checked");
+    evidence.fail_rag = false;
+    evidence.fail_llm = false;
+    evidence.llm_reply = "已打开空调。";
+    const auto baseline = pipeline.run_text("关闭空调");
+    require(baseline.status == VoiceStatus::kCompleted && baseline.vehicle && baseline.vehicle->climate_on == false,
+            "explicit OFF establishes the negative-case baseline");
+    const auto climate_before = baseline.vehicle->climate_on;
+    for (const auto* utterance : {"不要打开空调", "请不要打开空调", "请不要关闭空调", "可以打开空调吗",
+        "请打开空调吗", "请打开空调？", "如果太热就请打开空调", "他说请打开空调", "\"请打开空调\"",
+        "请打开空调然后关闭空调", "请打开空调，不要打开车窗", "请打开天窗"}) {
+        const auto result = pipeline.run_text(utterance);
+        require(result.status == VoiceStatus::kCompleted && result.vehicle && result.vehicle->action_applied == false &&
+            result.vehicle->climate_on == climate_before && result.vehicle->left_front_window_open == false,
+            "negation/question/quotation/multiple actions never become a vehicle command, even if LLM claims execution");
+    }
+}
+
 void music_routing_contract() {
     Evidence evidence;
-    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestLlm>(evidence),
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence), std::make_unique<TestLlm>(evidence),
                            std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(false, false));
     using Command = cabinflow::agent::v1::MusicCommand;
     const std::pair<const char*, Command::Action> commands[] = {
@@ -711,8 +808,8 @@ void music_routing_contract() {
         const auto result = pipeline.run_text(text);
         require(result.status == VoiceStatus::kCompleted && result.music_command && result.music_command->action() == action &&
             result.audio.bytes.empty() && result.answer.empty(), "music produces typed instruction, not speech or playback receipt");
-        require(result.vehicle && !result.vehicle->action_applied && !result.vehicle->climate_on &&
-            !result.vehicle->left_front_window_open, "music cannot mutate fake vehicle state");
+        require(result.vehicle && (result.vehicle->action_applied == false) && (result.vehicle->climate_on == false) &&
+            (result.vehicle->left_front_window_open == false), "music cannot mutate fake vehicle state");
     }
     const auto search = pipeline.run_text("搜索  周杰伦  ");
     require(search.music_command && search.music_command->keyword() == "周杰伦", "search keyword explicitly trimmed");
@@ -722,6 +819,94 @@ void music_routing_contract() {
     const auto audio = pipeline.run_wav({"test-input"});
     require(audio.music_command && audio.music_command->action() == Command::PAUSE && evidence.asr_calls == 1 &&
         evidence.llm_calls == 0 && evidence.tts_calls == 0, "ASR and text share one Router; music bypasses LLM/TTS");
+}
+
+void rag_routing_contract() {
+    Evidence evidence;
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
+        std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(false, false));
+    evidence.rag_match = RagDocument{1, "测试章节", "测试小节", "模拟资料正文", 0.8f};
+    const auto only = pipeline.run_text("自动泊车怎么用");
+    require(only.status == VoiceStatus::kCompleted && evidence.rag_calls == 1 && evidence.llm_calls == 0 &&
+        only.answer.find("模拟资料正文") != std::string::npos && only.answer.find("历史示例") != std::string::npos &&
+        evidence.tts_input == only.answer, "RAG_ONLY returns labeled source directly to TTS");
+    const auto hybrid = pipeline.run_text("法国的首都是什么");
+    require(hybrid.status == VoiceStatus::kCompleted && evidence.rag_calls == 2 && evidence.llm_calls == 1 &&
+        evidence.llm_input == "法国的首都是什么<rag>模拟资料正文", "HYBRID hit augments original query");
+    evidence.rag_match.reset();
+    const auto miss = pipeline.run_text("法国的首都是什么");
+    require(miss.status == VoiceStatus::kCompleted && evidence.rag_calls == 3 && evidence.llm_calls == 2 &&
+        evidence.llm_input == miss.transcript, "UNKNOWN HYBRID normal miss calls original-query LLM");
+    const auto only_miss = pipeline.run_text("发动机故障");
+    require(only_miss.status == VoiceStatus::kCompleted && only_miss.answer == "未找到相关资料。" &&
+        evidence.llm_calls == 2, "RAG_ONLY miss does not call LLM");
+    const auto creative = pipeline.run_text("推荐旅行路线");
+    require(creative.status == VoiceStatus::kCompleted && evidence.rag_calls == 4 && evidence.llm_calls == 3 &&
+        evidence.llm_input == creative.transcript, "creative LLM_ONLY skips RAG");
+    const auto rag_calls = evidence.rag_calls.load(), llm_calls = evidence.llm_calls.load(), tts_calls = evidence.tts_calls.load();
+    evidence.fail_rag = true;
+    const auto failure = pipeline.run_text("法国的首都是什么");
+    require(failure.status == VoiceStatus::kFailed && failure.detail == "injected_rag_failure" &&
+        evidence.llm_calls == llm_calls && evidence.tts_calls == tts_calls, "RAG failure is not no-match fallback");
+    evidence.fail_rag = false;
+    evidence.throw_rag = true;
+    const auto exception = pipeline.run_text("法国的首都是什么");
+    require(exception.status == VoiceStatus::kFailed && exception.detail == "injected_rag_exception" &&
+        evidence.llm_calls == llm_calls && evidence.tts_calls == tts_calls, "RAG exception stops downstream");
+    evidence.throw_rag = false;
+    evidence.rag_match = RagDocument{1, "章节", "小节", "", 0.8f};
+    const auto invalid = pipeline.run_text("法国的首都是什么");
+    require(invalid.status == VoiceStatus::kFailed && invalid.detail == "invalid_rag_document" &&
+        evidence.llm_calls == llm_calls && evidence.tts_calls == tts_calls, "invalid matched document is not a miss");
+    evidence.rag_match->text.assign(16 * 1024, 'x');
+    const auto oversized = pipeline.run_text("法国的首都是什么");
+    require(oversized.status == VoiceStatus::kFailed && oversized.detail == "rag_augmented_query_exceeds_limit" &&
+        evidence.llm_calls == llm_calls && evidence.tts_calls == tts_calls, "oversized HYBRID fails without truncation");
+    evidence.rag_match.reset();
+    require(pipeline.run_text("打开空调").status == VoiceStatus::kCompleted, "vehicle exact rule retains priority");
+    require(pipeline.run_text("暂停音乐").music_command.has_value(), "music exact rule retains priority");
+    require(evidence.rag_calls == rag_calls + 4, "vehicle and music never invoke RAG");
+    evidence.asr_transcript = "自动泊车怎么用";
+    const auto audio = pipeline.run_wav({"explicit-test-audio"});
+    require(audio.status == VoiceStatus::kCompleted && audio.answer == "未找到相关资料。" &&
+        evidence.llm_calls == llm_calls, "WAV shares the same tiered Router");
+}
+
+void rag_cancellation_contract(bool shutdown) {
+    Evidence evidence;
+    evidence.block_rag = true;
+    evidence.rag_match = RagDocument{1, "章节", "小节", "不能发布的迟到资料", 0.8f};
+    VoicePipeline pipeline(std::make_unique<TestAsr>(evidence), std::make_unique<TestRag>(evidence),
+        std::make_unique<TestLlm>(evidence), std::make_unique<TestTts>(evidence), std::make_unique<FakeVehicle>(false, false));
+    VoiceResult result;
+    std::atomic<bool> returned{false}, stopped{false};
+    std::thread controller([&] { result = pipeline.run_text("法国的首都是什么"); returned = true; });
+    bool entered;
+    {
+        std::unique_lock<std::mutex> lock(evidence.mutex);
+        entered = evidence.changed.wait_for(lock, std::chrono::seconds(2), [&] { return evidence.entered; });
+    }
+    const bool accepted = entered && pipeline.cancel();
+    std::thread stopper;
+    if (shutdown) stopper = std::thread([&] { pipeline.shutdown(); stopped = true; });
+    const bool early = returned || stopped;
+    const auto busy = pipeline.run_text("下一条消息");
+    {
+        std::lock_guard<std::mutex> lock(evidence.mutex);
+        evidence.released = true;
+    }
+    evidence.changed.notify_all();
+    controller.join();
+    if (stopper.joinable()) stopper.join();
+    require(entered && accepted && !early && busy.status == VoiceStatus::kBusy, "RAG cancellation waits for handler exit");
+    require(result.status == VoiceStatus::kCancelled && result.answer.empty() && result.audio.bytes.empty() &&
+        evidence.llm_calls == 0 && evidence.tts_calls == 0, "late RAG result cannot start LLM/TTS");
+    evidence.block_rag = false;
+    evidence.rag_match.reset();
+    const auto next = pipeline.run_text("新问题");
+    if (shutdown) require(stopped && next.status == VoiceStatus::kFailed, "shutdown rejects further tasks");
+    else require(next.status == VoiceStatus::kCompleted && next.work_id != result.work_id &&
+        evidence.llm_input == "新问题", "next work does not receive cancelled RAG context");
 }
 
 int main() {
@@ -745,6 +930,10 @@ int main() {
         window_cancellation_contract(false);
         window_cancellation_contract(true);
         music_routing_contract();
+        registered_climate_command_contract();
+        rag_routing_contract();
+        rag_cancellation_contract(false);
+        rag_cancellation_contract(true);
         std::cout << "voice pipeline contracts passed; test backends are not real inference\n";
         return 0;
     } catch (const std::exception& error) {

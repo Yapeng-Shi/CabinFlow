@@ -23,7 +23,12 @@ foreach(_file IN ITEMS
     endif()
 endforeach()
 
-add_library(cabinflow_native_backends STATIC src/native_backends.cpp src/wav.cpp)
+find_package(Python3 3.12 EXACT REQUIRED COMPONENTS Interpreter Development.Embed)
+find_package(pybind11 2.11.1 EXACT CONFIG REQUIRED)
+add_library(cabinflow_audio_codec STATIC src/wav.cpp)
+target_include_directories(cabinflow_audio_codec PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+cabinflow_enable_compiler_warnings(cabinflow_audio_codec)
+add_library(cabinflow_native_backends STATIC src/native_backends.cpp src/python_rag_backend.cpp)
 add_library(CabinFlow::NativeBackends ALIAS cabinflow_native_backends)
 target_compile_features(cabinflow_native_backends PUBLIC cxx_std_17)
 target_include_directories(cabinflow_native_backends
@@ -31,7 +36,11 @@ target_include_directories(cabinflow_native_backends
     PRIVATE "${_sherpa}/include" "${_llama}/include" "${_llama}/common"
             "${_llama}/ggml/include" "${_llama}/vendor")
 find_package(Threads REQUIRED)
+target_compile_definitions(cabinflow_native_backends PRIVATE
+    CABINFLOW_RAG_PYTHON_MODULE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/python")
 target_link_libraries(cabinflow_native_backends PRIVATE
+    cabinflow_audio_codec
+    pybind11::embed
     "${_llama_build}/common/libcommon.a"
     "${_llama_build}/src/libllama.a"
     "${_llama_build}/ggml/src/libggml.a"

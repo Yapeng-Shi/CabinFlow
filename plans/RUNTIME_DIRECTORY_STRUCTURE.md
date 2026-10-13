@@ -2,6 +2,8 @@
 
 更新日期：2026-10-02。本文保留现有目录职责、公开 target 和依赖，不代表所有旧能力已迁移；当前开发优先级已收敛为可交互 Demo。
 
+2026-10-11 补充：用户已批准在 `agent/` 恢复原 RAG/分级业务。`RagBackend` 端口、Python/Transformers 适配器在 `agent/inference/`，路由在 `agent/dialogue/`，`rag.primary` 装配/编排在 `agent/pipeline/`，领域 Protobuf 在 `agent/protocol/`。不新增 Runtime 目录、不让 Runtime/Gateway 依赖模型或 RAG schema。外部接入以实施计划已批准的 gRPC 为准；下方 TCP/FakeVehicle 为历史首版说明。[当前恢复记录](../agent/docs/rag-restoration-20261011.md)。
+
 ## 当前优先级：复用 Runtime，先完成 Demo
 
 当前执行入口是[Demo 实施计划](IMPLEMENTATION_PLAN.md)。用户已批准不再先做完整通用 Runtime/历史迁移收尾；只修 Demo 实际使用的安全退出、准入、取消和结果关联缺口，随后冻结 Runtime 扩展。

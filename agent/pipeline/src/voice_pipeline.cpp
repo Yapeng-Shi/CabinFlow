@@ -1,6 +1,7 @@
 #include <cabinflow/agent/voice_pipeline.hpp>
 
 #include <condition_variable>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <mutex>
@@ -75,7 +76,7 @@ VoiceResult result_identity(const protocol::MessageEnvelope& envelope) {
 }  // namespace
 
 struct VoicePipeline::State {
-    enum class Stage { kAsr, kDialogue, kLlm, kTts };
+    enum class Stage { kAsr, kDialogue, kRag, kLlm, kTts };
 
     class ModelNode final : public runtime::TargetNode {
     public:
@@ -88,6 +89,7 @@ struct VoicePipeline::State {
             switch (stage_) {
                 case Stage::kAsr: return "asr.primary";
                 case Stage::kDialogue: return "dialogue.primary";
+                case Stage::kRag: return "rag.primary";
                 case Stage::kLlm: return "llm.primary";
                 case Stage::kTts: return "tts.primary";
             }
@@ -118,7 +120,37 @@ struct VoicePipeline::State {
                     return MessageHandlingResult::kUnsupportedTopic;
                 if (cancelled()) { owner_.publish(cancelled_result()); return MessageHandlingResult::kHandled; }
                 if (stage_ == Stage::kDialogue) return route(message);
-                if (stage_ == Stage::kLlm) {
+                if (stage_ == Stage::kRag) {
+                    if (message.envelope.topic != "cockpit.rag.query") return MessageHandlingResult::kUnsupportedTopic;
+                    v1::TextInput input;
+                    if (!input.ParseFromString(message.payload) || input.text().empty() || input.text().size() > kMaxTextBytes)
+                        return MessageHandlingResult::kInvalidPayload;
+                    const auto started_ns = owner_.clock.now_monotonic_ns();
+                    auto result = owner_.rag->search(input.text(), cancelled);
+                    const auto finished_ns = owner_.clock.now_monotonic_ns();
+                    log_backend_call(message, result.error, finished_ns - started_ns);
+                    if (!result) owner_.publish({{}, result.error, std::move(result.detail)});
+                    else {
+                        v1::RagResult output;
+                        output.set_request_message_id(message.envelope.message_id);
+                        if (result.value.match) {
+                            const auto& match = *result.value.match;
+                            if (match.text.empty() || match.text.size() > kMaxTextBytes || match.section.empty() ||
+                                match.subsection.empty() || !std::isfinite(match.similarity) ||
+                                match.similarity < 0.5f || match.similarity > 1.00001f) {
+                                owner_.publish({{}, BackendError::kInferenceFailed, "invalid_rag_document"});
+                                return MessageHandlingResult::kHandled;
+                            }
+                            auto* document = output.mutable_match();
+                            document->set_id(match.id);
+                            document->set_section(match.section);
+                            document->set_subsection(match.subsection);
+                            document->set_text(match.text);
+                            document->set_similarity(match.similarity);
+                        } else output.mutable_no_match();
+                        owner_.publish(serialize(output));
+                    }
+                } else if (stage_ == Stage::kLlm) {
                     if (message.envelope.topic != "cockpit.llm.input") return MessageHandlingResult::kUnsupportedTopic;
                     v1::TextInput input;
                     if (!input.ParseFromString(message.payload) || input.text().empty() || input.text().size() > kMaxTextBytes)
@@ -207,6 +239,17 @@ struct VoicePipeline::State {
                 owner_.store_candidate(std::move(result));
                 return MessageHandlingResult::kHandled;
             }
+            if (stage_ == Stage::kDialogue && message.envelope.topic == "cockpit.vehicle.status.request") {
+                v1::VehicleStatusRequest status_request;
+                if (!status_request.ParseFromString(message.payload)) return MessageHandlingResult::kInvalidPayload;
+                const auto refreshed = owner_.refresh_vehicle();
+                result.status = refreshed ? VoiceStatus::kCompleted
+                    : refreshed.error == BackendError::kCancelled ? VoiceStatus::kCancelled : VoiceStatus::kFailed;
+                result.detail = refreshed.detail;
+                result.vehicle_status = static_cast<bool>(refreshed);
+                owner_.store_candidate(std::move(result));
+                return MessageHandlingResult::kHandled;
+            }
             v1::TextInput text;
             if (stage_ == Stage::kAsr) {
                 if (message.envelope.topic != "cockpit.audio.input") return MessageHandlingResult::kUnsupportedTopic;
@@ -268,11 +311,38 @@ struct VoicePipeline::State {
                 return MessageHandlingResult::kHandled;
             }
             if (routed.intent() == v1::COCKPIT_INTENT_UNRECOGNIZED) {
-                stage = owner_.deliver(make("cockpit.llm.input", "llm.primary", text.SerializeAsString()));
-                if (!stage) return fail(stage);
-                v1::SpeechText answer;
-                if (!answer.ParseFromString(stage.value) || answer.text().empty()) return fail({{}, BackendError::kInferenceFailed, "invalid_llm_output"});
-                result.answer = answer.text();
+                const auto answer_route = routed.answer_route();
+                if (answer_route != v1::ANSWER_ROUTE_RAG_ONLY && answer_route != v1::ANSWER_ROUTE_LLM_ONLY &&
+                    answer_route != v1::ANSWER_ROUTE_HYBRID)
+                    return fail({{}, BackendError::kInferenceFailed, "invalid_answer_route"});
+                bool run_llm = answer_route != v1::ANSWER_ROUTE_RAG_ONLY;
+                if (answer_route != v1::ANSWER_ROUTE_LLM_ONLY) {
+                    auto query = make("cockpit.rag.query", "rag.primary", text.SerializeAsString());
+                    const auto rag_request_id = query.envelope.message_id;
+                    stage = owner_.deliver(std::move(query));
+                    if (!stage) return fail(stage);
+                    v1::RagResult retrieved;
+                    if (!retrieved.ParseFromString(stage.value) || retrieved.request_message_id() != rag_request_id ||
+                        retrieved.outcome_case() == v1::RagResult::OUTCOME_NOT_SET)
+                        return fail({{}, BackendError::kInferenceFailed, "invalid_rag_output"});
+                    if (answer_route == v1::ANSWER_ROUTE_RAG_ONLY) {
+                        result.answer = retrieved.has_match() ?
+                            "历史示例知识库（非真实车辆手册）：\n" + retrieved.match().text() : "未找到相关资料。";
+                    } else if (retrieved.has_match()) {
+                        // 正常命中才附加旧合同的 <rag> 资料；错误/取消已经在上面终止。
+                        const auto augmented = text.text() + "<rag>" + retrieved.match().text();
+                        if (augmented.size() > kMaxTextBytes)
+                            return fail({{}, BackendError::kInvalidInput, "rag_augmented_query_exceeds_limit"});
+                        text.set_text(augmented);
+                    }
+                }
+                if (run_llm) {
+                    stage = owner_.deliver(make("cockpit.llm.input", "llm.primary", text.SerializeAsString()));
+                    if (!stage) return fail(stage);
+                    v1::SpeechText answer;
+                    if (!answer.ParseFromString(stage.value) || answer.text().empty()) return fail({{}, BackendError::kInferenceFailed, "invalid_llm_output"});
+                    result.answer = answer.text();
+                }
             } else if (routed.intent() == v1::COCKPIT_INTENT_CLIMATE_ON ||
                        routed.intent() == v1::COCKPIT_INTENT_CLIMATE_OFF ||
                        routed.intent() == v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN ||
@@ -303,9 +373,10 @@ struct VoicePipeline::State {
     };
 
     std::unique_ptr<inference::AsrBackend> asr;
+    std::unique_ptr<inference::RagBackend> rag;
     std::unique_ptr<inference::LlmBackend> llm;
     std::unique_ptr<inference::TtsBackend> tts;
-    std::unique_ptr<FakeVehicle> vehicle;
+    std::unique_ptr<VehicleBackend> vehicle;
     std::mutex run_mutex;
     std::mutex shutdown_mutex;
     std::mutex mutex;
@@ -313,7 +384,7 @@ struct VoicePipeline::State {
     bool accepting{true};
     bool cancellation_requested{false};
     bool handler_finished{false};
-    bool task_action_applied{false};
+    std::optional<bool> task_action_applied{false};
     std::optional<protocol::MessageEnvelope> active_request;
     std::optional<VoiceResult> candidate;
     std::optional<StageResult> stage_result;
@@ -325,14 +396,15 @@ struct VoicePipeline::State {
     gateway::ControlEnvelopeValidator validator{clock};
     runtime::Runtime runtime{transport, clock, logger};
 
-    State(std::unique_ptr<inference::AsrBackend> a, std::unique_ptr<inference::LlmBackend> l,
-          std::unique_ptr<inference::TtsBackend> t, std::unique_ptr<FakeVehicle> v)
-        : asr(std::move(a)), llm(std::move(l)), tts(std::move(t)), vehicle(std::move(v)) {
-        if (!asr || !llm || !tts || !vehicle) throw std::invalid_argument("all model backends and explicit FakeVehicle are required");
-        for (const auto* unit : {"asr.primary", "dialogue.primary", "llm.primary", "tts.primary"}) {
+    State(std::unique_ptr<inference::AsrBackend> a, std::unique_ptr<inference::RagBackend> r,
+          std::unique_ptr<inference::LlmBackend> l,
+          std::unique_ptr<inference::TtsBackend> t, std::unique_ptr<VehicleBackend> v)
+        : asr(std::move(a)), rag(std::move(r)), llm(std::move(l)), tts(std::move(t)), vehicle(std::move(v)) {
+        if (!asr || !rag || !llm || !tts || !vehicle) throw std::invalid_argument("all model backends and explicit VehicleBackend are required");
+        for (const auto* unit : {"asr.primary", "dialogue.primary", "rag.primary", "llm.primary", "tts.primary"}) {
             if (!registry.register_unit({unit, {unit}, 1})) throw std::runtime_error("cannot register pipeline unit");
         }
-        for (const auto stage : {Stage::kAsr, Stage::kDialogue, Stage::kLlm, Stage::kTts}) {
+        for (const auto stage : {Stage::kAsr, Stage::kDialogue, Stage::kRag, Stage::kLlm, Stage::kTts}) {
             if (runtime.add_target_node(std::make_unique<ModelNode>(*this, stage), 2) != runtime::RuntimeError::kNone)
                 throw std::runtime_error("cannot register model target");
         }
@@ -372,28 +444,51 @@ struct VoicePipeline::State {
         std::lock_guard<std::mutex> lock(mutex);
         candidate = std::move(result);
     }
+    SubmissionGate vehicle_gate() {
+        return [this](const std::function<void()>& write) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (cancellation_requested) return false;
+            // 取消检查和实际非阻塞提交线性化；回执等待由 Backend 在此临界区之外执行。
+            write();
+            return true;
+        };
+    }
+    StageResult refresh_vehicle() {
+        const auto observed = vehicle->query([this] { return is_cancelled(); }, vehicle_gate());
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            task_action_applied = observed.action_applied;
+        }
+        if (observed.error != VehicleError::none)
+            return {{}, observed.error == VehicleError::cancelled ? BackendError::kCancelled : BackendError::kInferenceFailed,
+                    std::string(vehicle_error_name(observed.error)) + ": " + observed.detail};
+        return {{}, BackendError::kNone, {}};
+    }
     StageResult apply_vehicle(v1::CockpitIntent intent) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (cancellation_requested) return cancelled_result();
-        // 设置与 cancel/complete 共用锁；action_applied 记录已执行事实，取消或 TTS 失败不回滚。
+        VehicleSnapshot observed;
         std::string_view reply;
+        const CancelPredicate cancelled = [this] { return is_cancelled(); };
+        const auto submit = vehicle_gate();
         switch (intent) {
         case v1::COCKPIT_INTENT_CLIMATE_ON:
-        case v1::COCKPIT_INTENT_CLIMATE_OFF: {
-            const bool actual_on = vehicle->set_climate(intent == v1::COCKPIT_INTENT_CLIMATE_ON);
-            reply = actual_on ? "模拟空调已打开。" : "模拟空调已关闭。";
+        case v1::COCKPIT_INTENT_CLIMATE_OFF:
+            observed = vehicle->set_climate(intent == v1::COCKPIT_INTENT_CLIMATE_ON, cancelled, submit);
+            reply = intent == v1::COCKPIT_INTENT_CLIMATE_ON ? "模拟空调已打开。" : "模拟空调已关闭。";
             break;
-        }
         case v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN:
-        case v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_CLOSE: {
-            const bool actual_open = vehicle->set_left_front_window(intent == v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN);
-            reply = actual_open ? "模拟左前车窗已打开。" : "模拟左前车窗已关闭。";
+        case v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_CLOSE:
+            observed = vehicle->set_left_front_window(intent == v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN, cancelled, submit);
+            reply = intent == v1::COCKPIT_INTENT_LEFT_FRONT_WINDOW_OPEN ? "模拟左前车窗已打开。" : "模拟左前车窗已关闭。";
             break;
-        }
         default: return {{}, BackendError::kInvalidInput, "unsupported_vehicle_intent"};
         }
-        task_action_applied = true;
-        // 先记录动作，再分配回答文本；分配失败也不能把已发生动作标成未执行。
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            task_action_applied = observed.action_applied;
+        }
+        if (observed.error != VehicleError::none)
+            return {{}, observed.error == VehicleError::cancelled ? BackendError::kCancelled : BackendError::kInferenceFailed,
+                    std::string(vehicle_error_name(observed.error)) + ": " + observed.detail};
         return {std::string(reply), BackendError::kNone, {}};
     }
     void reset_stage() { std::lock_guard<std::mutex> lock(mutex); stage_result.reset(); handler_finished = false; }
@@ -466,14 +561,16 @@ struct VoicePipeline::State {
         // 从独立模拟状态和本次动作事实构造回执，不能依赖可能被 SDK 异常替换的 candidate。
         auto* receipt = output.mutable_vehicle();
         receipt->set_simulated(true);
-        receipt->set_climate_on(vehicle->climate_on());
-        receipt->set_action_applied(task_action_applied);
-        receipt->set_left_front_window_open(vehicle->left_front_window_open());
+        const auto actual = vehicle->snapshot();
+        if (actual.climate_on) receipt->set_climate_on(*actual.climate_on);
+        if (actual.left_front_window_open) receipt->set_left_front_window_open(*actual.left_front_window_open);
+        if (task_action_applied) receipt->set_action_applied(*task_action_applied);
         gateway::DataTaskOutput wire;
         wire.topic = "cockpit.task.result";
         if (result.status == VoiceStatus::kCompleted) {
             output.set_answer(result.answer);
-            if (result.music_command) *output.mutable_music_command() = *result.music_command;
+            if (result.vehicle_status) output.mutable_vehicle_status();
+            else if (result.music_command) *output.mutable_music_command() = *result.music_command;
             else {
                 output.mutable_audio()->set_request_message_id(result.request_message_id);
                 output.mutable_audio()->set_wav_bytes(std::move(result.audio.bytes));
@@ -529,10 +626,11 @@ struct VoicePipeline::State {
 };
 
 VoicePipeline::VoicePipeline(std::unique_ptr<inference::AsrBackend> asr,
+                             std::unique_ptr<inference::RagBackend> rag,
                              std::unique_ptr<inference::LlmBackend> llm,
                              std::unique_ptr<inference::TtsBackend> tts,
-                             std::unique_ptr<FakeVehicle> vehicle)
-    : state_(std::make_unique<State>(std::move(asr), std::move(llm), std::move(tts), std::move(vehicle))) {}
+                             std::unique_ptr<VehicleBackend> vehicle)
+    : state_(std::make_unique<State>(std::move(asr), std::move(rag), std::move(llm), std::move(tts), std::move(vehicle))) {}
 VoicePipeline::~VoicePipeline() = default;
 runtime::Runtime& VoicePipeline::runtime() noexcept { return state_->runtime; }
 runtime::UnitRegistry& VoicePipeline::registry() noexcept { return state_->registry; }
@@ -554,7 +652,9 @@ bool VoicePipeline::cancel() {
 VoiceResult VoicePipeline::run_text(std::string text) { return run(false, std::move(text)); }
 VoiceResult VoicePipeline::run_wav(inference::WavAudio audio) { return run(true, std::move(audio.bytes)); }
 
-VoiceResult VoicePipeline::run(bool audio_input, std::string input) {
+VoiceResult VoicePipeline::refresh_vehicle_state() { return run(false, {}, true); }
+
+VoiceResult VoicePipeline::run(bool audio_input, std::string input, bool status_query) {
     VoiceResult result;
     std::unique_lock<std::mutex> one_run(state_->run_mutex, std::try_to_lock);
     if (!one_run.owns_lock()) { result.status = VoiceStatus::kBusy; result.detail = "task_already_active"; return result; }
@@ -569,7 +669,7 @@ VoiceResult VoicePipeline::run(bool audio_input, std::string input) {
     root.envelope.message_id = root.envelope.trace_id + ":input";
     root.envelope.source_node = "voice.client";
     root.envelope.target_node = audio_input ? "asr.primary" : "dialogue.primary";
-    root.envelope.topic = audio_input ? "cockpit.audio.input" : "cockpit.text.input";
+    root.envelope.topic = status_query ? "cockpit.vehicle.status.request" : audio_input ? "cockpit.audio.input" : "cockpit.text.input";
     root.envelope.created_monotonic_ns = state_->clock.now_monotonic_ns();
     root.envelope.ttl_ms = kTaskTtlMs;
     root.envelope.is_final = true;
@@ -580,7 +680,8 @@ VoiceResult VoicePipeline::run(bool audio_input, std::string input) {
         setup.mutable_setup()->set_unit_id(root.envelope.target_node);
         root.envelope.work_id = state_->command(root, setup).setup().work().work_id();
         result = result_identity(root.envelope);
-        if (audio_input) { v1::AudioInput payload; payload.set_wav_bytes(std::move(input)); root.payload = payload.SerializeAsString(); }
+        if (status_query) { v1::VehicleStatusRequest payload; root.payload = payload.SerializeAsString(); }
+        else if (audio_input) { v1::AudioInput payload; payload.set_wav_bytes(std::move(input)); root.payload = payload.SerializeAsString(); }
         else { v1::TextInput payload; payload.set_text(std::move(input)); root.payload = payload.SerializeAsString(); }
         slot_reserved = task_hooks.try_reserve(root);
         if (!slot_reserved) { result.status = VoiceStatus::kBusy; throw std::runtime_error("task_already_active_or_shutting_down"); }
@@ -610,12 +711,16 @@ VoiceResult VoicePipeline::run(bool audio_input, std::string input) {
         v1::VoiceTaskResult terminal;
         if (!terminal.ParseFromString(output.payload) || terminal.request_message_id() != result.request_message_id)
             throw std::runtime_error("invalid_final_task_result");
-        if (!terminal.has_vehicle() || !terminal.vehicle().simulated() || !terminal.vehicle().has_left_front_window_open())
+        if (!terminal.has_vehicle() || !terminal.vehicle().simulated())
             throw std::runtime_error("invalid_final_vehicle_receipt");
-        result.vehicle = VehicleReceipt{terminal.vehicle().simulated(), terminal.vehicle().climate_on(),
-                                        terminal.vehicle().action_applied(), terminal.vehicle().left_front_window_open()};
+        const auto& receipt = terminal.vehicle();
+        result.vehicle = VehicleReceipt{receipt.simulated(),
+            receipt.has_climate_on() ? std::optional<bool>(receipt.climate_on()) : std::nullopt,
+            receipt.has_action_applied() ? std::optional<bool>(receipt.action_applied()) : std::nullopt,
+            receipt.has_left_front_window_open() ? std::optional<bool>(receipt.left_front_window_open()) : std::nullopt};
         result.transcript = terminal.transcript();
-        if (terminal.has_audio()) { result.status = VoiceStatus::kCompleted; result.answer = terminal.answer(); result.audio.bytes = terminal.audio().wav_bytes(); }
+        if (terminal.has_vehicle_status()) { result.status = VoiceStatus::kCompleted; result.vehicle_status = true; }
+        else if (terminal.has_audio()) { result.status = VoiceStatus::kCompleted; result.answer = terminal.answer(); result.audio.bytes = terminal.audio().wav_bytes(); }
         else if (terminal.has_music_command() && is_valid_music_command(terminal.music_command())) {
             result.status = VoiceStatus::kCompleted;
             result.music_command = terminal.music_command();

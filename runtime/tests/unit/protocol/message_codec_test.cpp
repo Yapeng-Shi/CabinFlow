@@ -64,6 +64,14 @@ int main() {
     }
 
     const auto malformed = cabinflow::protocol::decode_message("not protobuf");
+    for (const std::uint32_t version : {65537U, 0xffffffffU}) {
+        original.envelope.schema_version = version;
+        const auto wire = cabinflow::protocol::encode_message(original);
+        const auto roundtrip = cabinflow::protocol::decode_message(wire.bytes);
+        if (!expect(static_cast<bool>(wire) && static_cast<bool>(roundtrip) &&
+                    roundtrip.message.envelope.schema_version == version,
+                    "schema uint32 roundtrip never narrows unknown version")) return 1;
+    }
     if (!expect(malformed.error == CodecError::kMalformedMessage,
                 "malformed input")) {
         return 1;

@@ -5,6 +5,7 @@ protobuf_generate_cpp(CABINFLOW_AGENT_PROTOCOL_PROTO_SOURCES
     proto/cockpit_text.proto
     proto/cockpit_audio.proto
     proto/cockpit_task.proto
+    proto/cockpit_vehicle.proto
 )
 
 add_library(cabinflow_agent_protocol

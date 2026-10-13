@@ -33,9 +33,36 @@ enum CockpitIntent {
   COCKPIT_INTENT_MUSIC = 7;
 }
 
+enum AnswerRoute {
+  ANSWER_ROUTE_UNSPECIFIED = 0;
+  ANSWER_ROUTE_RAG_ONLY = 1;
+  ANSWER_ROUTE_LLM_ONLY = 2;
+  ANSWER_ROUTE_HYBRID = 3;
+}
+
+// 历史示例知识库的检索结果；不是实际车辆手册或车控指令。
+message RagDocument {
+  uint32 id = 1;
+  string section = 2;
+  string subsection = 3;
+  string text = 4;
+  float similarity = 5;
+}
+
+message RagNoMatch {}
+
+message RagResult {
+  string request_message_id = 1;
+  oneof outcome {
+    RagDocument match = 2;
+    RagNoMatch no_match = 3;
+  }
+}
+
 message TextOutput {
   string request_message_id = 1;
   CockpitIntent intent = 2;
   string text = 3;
   MusicCommand music_command = 4;
+  AnswerRoute answer_route = 5;
 }

@@ -11,10 +11,6 @@
 #include <cabinflow/protocol/message_envelope.hpp>
 #include <cabinflow/runtime/runtime.hpp>
 
-namespace cabinflow::net {
-class EventLoop;
-}
-
 namespace cabinflow::runtime {
 class Clock;
 class Runtime;
@@ -40,10 +36,10 @@ struct DataTaskHooks {
     std::function<void(const protocol::MessageEnvelope&)> cancel;
 };
 
-// TCP control-plane entrypoint. 调用方必须先配置，再在 EventLoop owner 线程启动和停止。
+// gRPC 外部入口。所有异步流必须收敛后才销毁；Runtime worker 必须先 drain。
 class ControlGateway final {
 public:
-    ControlGateway(net::EventLoop& loop, std::string name, std::string listen_ip,
+    ControlGateway(std::string name, std::string listen_ip,
                    std::uint16_t listen_port, runtime::UnitRegistry& registry,
                    runtime::Runtime& runtime,
                    const runtime::Clock& clock, std::uint32_t response_ttl_ms);
@@ -54,9 +50,9 @@ public:
     ControlGateway(ControlGateway&&) = delete;
     ControlGateway& operator=(ControlGateway&&) = delete;
 
-    void set_worker_count(std::size_t worker_count);
     void set_data_task_hooks(DataTaskHooks hooks);
     void start();
+    void stop_admission();
     void stop();
 
     [[nodiscard]] std::uint16_t bound_port() const;

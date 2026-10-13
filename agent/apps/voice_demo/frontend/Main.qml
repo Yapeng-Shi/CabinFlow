@@ -51,7 +51,7 @@ ApplicationWindow {
             ColumnLayout {
                 spacing: 3
                 Label { Layout.alignment: Qt.AlignRight; text: voiceClient.status; color: voiceClient.busy ? "#edc17d" : "#98dfce"; font.pixelSize: 16 }
-                Label { Layout.alignment: Qt.AlignRight; text: voiceClient.connected ? "TCP 后端已连接" : "TCP 后端未连接"; color: "#8ca2b1"; font.pixelSize: 11 }
+                Label { Layout.alignment: Qt.AlignRight; text: voiceClient.connected ? "gRPC 后端已连接" : "gRPC 后端未连接"; color: "#8ca2b1"; font.pixelSize: 11 }
             }
             BusyIndicator { running: voiceClient.busy; visible: running; implicitWidth: 30; implicitHeight: 30 }
         }
@@ -101,7 +101,29 @@ ApplicationWindow {
                             width: interactionScroll.availableWidth
                             spacing: 9
                             Label { text: "语音与文本"; color: "#edf4f6"; font.pixelSize: 19; font.bold: true }
-                            Label { text: "输入问题，或选择短 WAV 发起单次任务"; color: "#91a8b7"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Label { text: "开启麦克风后先说“你好，小舱”，看到提示再说指令"; color: "#91a8b7"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Switch {
+                                id: wakeSwitch
+                                objectName: "wakeSwitch"
+                                text: "本地唤醒（待真人验收）· 麦克风"
+                                checked: voiceClient.wakeEnabled
+                                onToggled: voiceClient.setWakeEnabled(checked)
+                                font.pixelSize: 12
+                                indicator: Rectangle {
+                                    implicitWidth: 38; implicitHeight: 20; radius: 10
+                                    y: (wakeSwitch.height - height) / 2
+                                    color: wakeSwitch.checked ? "#79cdbb" : "#405968"
+                                    Rectangle { width: 14; height: 14; radius: 7; y: 3; x: wakeSwitch.checked ? 21 : 3; color: "#e8f0f4" }
+                                }
+                                contentItem: Text {
+                                    text: wakeSwitch.text; font: wakeSwitch.font; color: "#c4d4de"
+                                    leftPadding: wakeSwitch.indicator.width + wakeSwitch.spacing
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                            }
+                            Label { objectName: "wakeStatus"; text: voiceClient.wakeStatus; color: "#98dfce"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Label { text: voiceClient.wakeError; visible: text.length > 0; color: "#ff9d91"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Label { text: "5 秒等待开口 · 静音 0.8 秒结束 · 最长 15 秒\n处理和回答播放期间暂停监听；文本 / WAV 为调试输入"; color: "#91a8b7"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
                             TextField {
                                 id: textInput
                                 Layout.fillWidth: true
@@ -133,12 +155,19 @@ ApplicationWindow {
                                 ActionButton { Layout.fillWidth: true; text: "取消任务"; enabled: voiceClient.busy; onClicked: voiceClient.cancel() }
                                 ActionButton { Layout.fillWidth: true; text: "连接后端"; enabled: !voiceClient.connected && !voiceClient.busy; onClicked: voiceClient.connectBackend() }
                             }
+                            ActionButton {
+                                objectName: "refreshVehicleState"
+                                Layout.fillWidth: true
+                                text: "刷新车辆状态（虚拟 ECU）"
+                                enabled: voiceClient.connected && !voiceClient.busy && !musicController.busy
+                                onClicked: voiceClient.refreshVehicleState()
+                            }
                             Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#30434f"; Layout.topMargin: 3; Layout.bottomMargin: 3 }
                             Label { text: "回答"; color: "#c4d4de"; font.pixelSize: 14; font.bold: true }
                             Label { text: "转写：" + (voiceClient.transcript || "等待输入"); color: "#91a8b7"; font.pixelSize: 12; wrapMode: Text.Wrap; Layout.fillWidth: true }
                             ScrollView {
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: Math.max(82, interaction.height - 435)
+                                Layout.preferredHeight: Math.max(82, interaction.height - 590)
                                 clip: true
                                 TextArea {
                                     text: voiceClient.answer
@@ -157,7 +186,7 @@ ApplicationWindow {
                                 objectName: "playbackControls"
                                 Layout.fillWidth: true
                                 ActionButton { Layout.fillWidth: true; text: "播放回答"; enabled: voiceClient.hasAudio && !voiceClient.busy && !musicController.busy; onClicked: voiceClient.play() }
-                                ActionButton { Layout.fillWidth: true; text: "停止播放"; enabled: voiceClient.playing; onClicked: voiceClient.stopPlayback() }
+                                ActionButton { Layout.fillWidth: true; text: "停止播放"; enabled: voiceClient.playbackActive; onClicked: voiceClient.stopPlayback() }
                             }
                             Label { text: voiceClient.playing ? "正在播放回答" : ""; visible: voiceClient.playing; color: "#98dfce"; font.pixelSize: 12 }
                             Label { text: voiceClient.vehicleAction; color: "#8ca2b1"; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }

@@ -31,6 +31,20 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// 应用装配线程创建/销毁；每个进程只允许一次 Python 解释器生命周期。
+class PythonRagBackend final : public RagBackend {
+public:
+    PythonRagBackend(std::string site_packages, std::string model_directory,
+                     std::string index_directory, int threads);
+    ~PythonRagBackend() override;
+    BackendResult<RagSearchResult> search(
+        std::string_view query, const CancellationCheck& cancelled) override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class SherpaTtsBackend final : public TtsBackend {
 public:
     explicit SherpaTtsBackend(std::string model_directory);

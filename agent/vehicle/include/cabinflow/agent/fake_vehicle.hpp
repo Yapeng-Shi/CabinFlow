@@ -1,19 +1,25 @@
 #pragma once
 
+#include <cabinflow/agent/vehicle_backend.hpp>
+#include <mutex>
+
 namespace cabinflow::agent {
 
-// 具体模拟状态，无自有线程；共享访问由 VoicePipeline 的任务状态锁保护。
-class FakeVehicle final {
+// 仅供确定性测试；状态锁属于后端，调用者不能依赖流水线锁保护它。
+class FakeVehicle final : public VehicleBackend {
 public:
     FakeVehicle(bool initial_climate_on, bool initial_left_front_window_open) noexcept;
-    [[nodiscard]] bool set_climate(bool on) noexcept;
-    [[nodiscard]] bool climate_on() const noexcept;
-    [[nodiscard]] bool set_left_front_window(bool open) noexcept;
-    [[nodiscard]] bool left_front_window_open() const noexcept;
+    VehicleSnapshot query(const CancelPredicate& cancelled = {}, const SubmissionGate& submit = {}) override;
+    VehicleSnapshot set_climate(bool on, const CancelPredicate& cancelled = {}, const SubmissionGate& submit = {}) override;
+    VehicleSnapshot set_left_front_window(bool open, const CancelPredicate& cancelled = {}, const SubmissionGate& submit = {}) override;
+    [[nodiscard]] VehicleSnapshot snapshot() const override;
 
 private:
-    bool climate_on_;
-    bool left_front_window_open_;
+    VehicleSnapshot execute(std::optional<bool> climate, std::optional<bool> window,
+                            const CancelPredicate& cancelled, const SubmissionGate& submit);
+    std::mutex operation_mutex_;
+    mutable std::mutex mutex_;
+    VehicleSnapshot state_;
 };
 
 }  // namespace cabinflow::agent

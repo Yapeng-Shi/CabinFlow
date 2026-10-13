@@ -38,7 +38,7 @@ concrete Agent nodes and their integration tests: neither `Runtime` nor
 
 The in-process two-node demo uses `ITransport` directly. Its subscription
 callback performs Ledger admission before business processing; it is not the
-TCP Gateway's target queue path:
+gRPC Gateway's target queue path:
 
 ```text
 TextSourceNode -> ITransport.publish -> EchoProcessorNode subscription callback
@@ -49,16 +49,16 @@ For ZeroMQ the transport routing step has two frames: `topic` and a
 Protobuf-encoded `RuntimeMessage`. The receiver decodes and verifies that both
 topic values agree before dispatching a handler.
 
-The TCP data plane uses one framed path and no JSON fallback:
+The gRPC data plane uses one framed path and no JSON fallback:
 
 ```text
-TCP Framer -> RuntimeMessage decode -> Envelope/work-owner validation
+gRPC stream -> RuntimeMessage decode -> Envelope/work-owner validation
   -> target queue reservation -> SessionLedger admission -> queue commit
   -> TargetNode worker -> topic-specific payload decode
 ```
 
 The current typed Agent path is `cockpit.text.input -> dialogue.primary ->
-cockpit.text.output`. Gateway routes the final output to the TCP connection
+cockpit.text.output`. Gateway routes the final output to the gRPC stream
 associated with that input's `(session_id, message_id)`; a work is not bound
 permanently to a connection. This rule-based path recognizes cockpit intents
 but does not execute vehicle controls or run ASR/LLM/TTS models.
@@ -71,7 +71,7 @@ the work for `asr.primary`, and submits each typed data stage through Runtime
 reservation and Ledger admission.
 That experiment is not a TCP audio ingress path or a real model pipeline.
 Gateway now checks every external data target against the work-owning Unit.
-`data_plane_gateway_tcp_test` verifies rejection before Ledger mutation, a valid
+`data_plane_gateway_grpc_test` verifies rejection before Ledger mutation, a valid
 resubmission, and preserved internal cross-Target delivery under the same work.
 
 The separate real-model Agent app composes this Gateway with `VoicePipeline`.
@@ -88,7 +88,7 @@ See the [Agent integration guide](../../agent/docs/voice-demo-integration.md).
 Control requests use a separate admission path:
 
 ```text
-TCP Framer -> ControlEnvelopeValidator -> ControlService -> UnitRegistry
+gRPC stream -> ControlEnvelopeValidator -> ControlService -> UnitRegistry
 ```
 
 `Setup` creates a server-side work ID without entering the data Ledger.
@@ -133,3 +133,19 @@ single cleanup owner; terminal state is published only after cleanup. Direct
 stop from a worker or lifecycle callback is still a pending decision, not an
 implemented asynchronous shutdown path. See ADR-009 and the migration closeout
 record for the tested boundary.
+
+## External gRPC ownership (2026-10-06)
+
+`CabinFlow::GrpcProtocol` owns generated service code; Gateway and the Qt client
+link it, while Runtime Core remains gRPC- and AgentProtocol-independent.
+Each loopback stream has one read and one write in flight. Its output queue
+holds at most eight messages including the current write; overflow terminates
+with `RESOURCE_EXHAUSTED`. Response sequence allocation and enqueue are serialized.
+The Qt completion queue runs on a dedicated thread, never the GUI thread.
+Disconnect releases stream destinations but does not implicitly cancel works.
+Application shutdown stops admission, drains the application pipeline, then
+shuts down gRPC with a bounded deadline. No TCP fallback or automatic replay exists.
+
+Vehicle payloads, CAN codec, SocketCAN and ECU belong to Agent, not Runtime.
+Unknown receipt fields are absent optional bools, not fabricated false values.
+See [current migration evidence](../../agent/docs/grpc-can-migration-20261006.md).

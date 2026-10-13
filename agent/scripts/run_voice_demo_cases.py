@@ -24,12 +24,13 @@ def parse_result(path):
     answer, tail = content.rsplit("\nerror=", 1)
     error, _ = tail.split("\nsemantic_quality=", 1)
     fields = dict(line.split("=", 1) for line in identity.splitlines())
-    receipt = re.search(r"\nvehicle_simulated=([01])\nclimate_on=([01])\naction_applied=([01])\nleft_front_window_open=([01])\n$", text)
+    receipt = re.search(r"\nvehicle_simulated=([01])\nclimate_on=([01]|unknown)\naction_applied=([01]|unknown)\nleft_front_window_open=([01]|unknown)\n$", text)
     if receipt is None and not text.endswith("\nvehicle_state=unknown\n"):
         raise ValueError("vehicle receipt missing required left_front_window_open or malformed")
     return dict(fields, transcript=transcript, answer=answer, error=error,
                 vehicle=None if receipt is None else dict(zip(
-                    ("simulated", "climate_on", "action_applied", "left_front_window_open"), [value == "1" for value in receipt.groups()])))
+                    ("simulated", "climate_on", "action_applied", "left_front_window_open"),
+                    [None if value == "unknown" else value == "1" for value in receipt.groups()])))
 
 
 def parse_timings(stdout, request_id):
@@ -97,7 +98,8 @@ def run(args, report):
                                      "llama_cpp": "b6500", "llm": "Qwen3-0.6B Q8_0 non-thinking",
                                      "model_threads": 2, "context": 2048, "max_new_tokens": 128}
     report["measurement_conditions"] = "Shared WSL development host; background contract tests may overlap; raw observations, not an uncontended benchmark."
-    report["model_paths"] = [str(args.asr_model), str(args.llm_model), str(args.tts_model)]
+    report["model_paths"] = [str(args.asr_model), str(args.llm_model), str(args.tts_model), str(args.rag_model)]
+    report["rag_assets"] = {"site_packages": str(args.rag_site_packages), "index": str(args.rag_index)}
     report["llm_sha256"] = smoke.digest(args.llm_model)
     report["host"] = {"platform": platform.platform(), "python": platform.python_version(),
                       "cpuinfo": Path("/proc/cpuinfo").read_text(encoding="utf-8")}
@@ -112,7 +114,8 @@ def run(args, report):
             case_dir.mkdir()
             command = ["/usr/bin/time", "-v", "-o", str(case_dir / "resources.txt"),
                        str(args.binary.resolve()), "--wav", case["wav_path"], str(case_dir / "result"),
-                       str(args.asr_model.resolve()), str(args.llm_model.resolve()), str(args.tts_model.resolve())]
+                       str(args.asr_model.resolve()), str(args.llm_model.resolve()), str(args.tts_model.resolve()),
+                       str(args.rag_site_packages.resolve()), str(args.rag_model.resolve()), str(args.rag_index.resolve())]
             record = {"case_id": case["id"], "repetition": repetition, "command": command,
                       "reference_text": case["reference_text"], "expected_result": case["expected_result"],
                       "input_audio": case["input_audio"], "source_type": "synthetic",
@@ -150,12 +153,13 @@ def run(args, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("cases", "binary", "output-dir", "asr-model", "llm-model", "tts-model"):
+    for name in ("cases", "binary", "output-dir", "asr-model", "llm-model", "tts-model",
+                 "rag-site-packages", "rag-model", "rag-index"):
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     report = {"status": "running", "samples": [], "concurrency": 1, "planned_sample_count": 15,
-              "entry": "CLI integration only, not Qt/TCP acceptance", "human_listening": "not_verified"}
+              "entry": "CLI integration only, not Qt/gRPC acceptance", "human_listening": "not_verified"}
     try:
         run(args, report)
     except KeyboardInterrupt:

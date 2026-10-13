@@ -1,5 +1,6 @@
 #include <cabinflow/agent/inference/native_backends.hpp>
 #include <cabinflow/agent/voice_pipeline.hpp>
+#include <cabinflow/agent/socket_can_vehicle.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -24,8 +25,8 @@ std::string read_wav(const std::string& path) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 7 || (std::string_view(argv[1]) != "--text" && std::string_view(argv[1]) != "--wav")) {
-            std::cerr << "usage: voice_demo (--text TEXT | --wav INPUT.wav) OUTPUT_DIRECTORY ASR_MODEL_DIR LLM_GGUF TTS_MODEL_DIR\n";
+        if (argc != 10 || (std::string_view(argv[1]) != "--text" && std::string_view(argv[1]) != "--wav")) {
+            std::cerr << "usage: voice_demo (--text TEXT | --wav INPUT.wav) OUTPUT_DIRECTORY ASR_MODEL_DIR LLM_GGUF TTS_MODEL_DIR RAG_SITE_PACKAGES RAG_MODEL_DIR RAG_INDEX_DIR\n";
             return 2;
         }
         // 全新目录保证不会把历史 WAV 当作本次成功；模型由装配入口选择唯一实现。
@@ -33,13 +34,18 @@ int main(int argc, char** argv) {
         if (!std::filesystem::create_directory(output)) throw std::runtime_error("output directory must be new");
         const bool wav_mode = std::string_view(argv[1]) == "--wav";
         auto input = wav_mode ? read_wav(argv[2]) : std::string(argv[2]);
+        auto vehicle = std::make_unique<cabinflow::agent::SocketCanVehicle>();
+        const auto initial = vehicle->query();
+        if (initial.error != cabinflow::agent::VehicleError::none)
+            throw std::runtime_error("vcan0 ECU not ready: " + initial.detail);
         cabinflow::agent::VoicePipeline pipeline(
             std::make_unique<cabinflow::agent::inference::SherpaAsrBackend>(argv[4]),
+            std::make_unique<cabinflow::agent::inference::PythonRagBackend>(argv[7], argv[8], argv[9], 2),
             std::make_unique<cabinflow::agent::inference::LlamaBackend>(argv[5], 2, 2048, 128),
             std::make_unique<cabinflow::agent::inference::SherpaTtsBackend>(argv[6]),
-            std::make_unique<cabinflow::agent::FakeVehicle>(false, false));  // 明确以空调关、左前车窗关启动。
+            std::move(vehicle));
         const auto result = wav_mode ? pipeline.run_wav({std::move(input)}) : pipeline.run_text(std::move(input));
-        // 与 TCP 相同的根 completion 已清理 work；外部控制线程此时才停止 Runtime。
+        // 与 gRPC 相同的根 completion 已清理 work；外部控制线程此时才停止 Runtime。
         pipeline.shutdown();
         std::ofstream report(output / "result.txt");
         report << "status=" << static_cast<int>(result.status) << "\ntrace_id=" << result.trace_id
@@ -47,11 +53,12 @@ int main(int argc, char** argv) {
                << "\nrequest_message_id=" << result.request_message_id << "\ntranscript=" << result.transcript
                << "\nanswer=" << result.answer << "\nerror=" << result.detail
                << "\nsemantic_quality=not_automatically_verified\nhuman_listening=not_verified\n";
+        const auto optional_fact = [](std::optional<bool> value) { return value ? (*value ? "1" : "0") : "unknown"; };
         if (result.vehicle) {
             report << "vehicle_simulated=" << result.vehicle->simulated
-                   << "\nclimate_on=" << result.vehicle->climate_on
-                   << "\naction_applied=" << result.vehicle->action_applied
-                   << "\nleft_front_window_open=" << result.vehicle->left_front_window_open << '\n';
+                   << "\nclimate_on=" << optional_fact(result.vehicle->climate_on)
+                   << "\naction_applied=" << optional_fact(result.vehicle->action_applied)
+                   << "\nleft_front_window_open=" << optional_fact(result.vehicle->left_front_window_open) << '\n';
         } else report << "vehicle_state=unknown\n";
         if (result.music_command) report << "music_action=" << result.music_command->action()
             << "\nmusic_keyword=" << result.music_command->keyword()

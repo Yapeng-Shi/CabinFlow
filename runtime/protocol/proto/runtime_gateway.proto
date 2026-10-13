@@ -1,0 +1,8 @@
+syntax = "proto3";
+package cabinflow.protocol.v1;
+import "runtime_envelope.proto";
+
+// 外部入口只有通用消息流；业务 payload 的解释仍由 Agent 节点负责。
+service RuntimeGateway {
+  rpc Connect(stream RuntimeMessage) returns (stream RuntimeMessage);
+}

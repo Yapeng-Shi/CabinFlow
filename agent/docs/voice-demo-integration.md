@@ -1,5 +1,16 @@
 # 真实组件的最小集成切片
 
+> 2026-10-13：客户端新增显式唤醒模型目录参数；麦克风默认关闭。KWS/单轮录音代码已接入，唤醒词检测与真人采集门槛未通过，见[实现与验收边界](wake-input-20261013.md)。本次不改 Runtime/gRPC/CAN 与原推理模型。
+
+> 2026-10-11：当前启动接口新增必填的 RAG site-packages、模型目录与索引目录；`rag.primary` 通过原分级路由接入同一 VoicePipeline。请先准备 [RAG 依赖和权重](rag-restoration-20261011.md)，当前命令与验收也以该记录为准。本文下方旧 argc/TCP/FakeVehicle 命令和质量记录按日期保留，不是兼容入口。
+
+> 当前实现更新（2026-10-07）：产品入口已迁移为 gRPC 双向流，生产车控改为
+> SocketCAN / 独立虚拟 ECU，FakeVehicle 仅用于测试。匹配 WSL 内核、实际 vcan 集成与
+> gRPC/模型/Wayland Qt 回执闭环已通过；人工听验、模型质量和更广 sanitizer 问题未关闭。
+> 当前操作与前提以 [环境与实总线验收](wsl-vcan-20261007.md)、[gRPC/CAN 迁移记录](grpc-can-migration-20261006.md)
+> 为准；下文 2026-10-03 的 TCP、FakeVehicle 构造与运行结果保留为历史证据，
+> 不适用于新版本启动，不可当作本次验收。
+
 更新：2026-10-03。按用户确认，先搭系统并解耦；模型质量独立验收，不阻塞集成。
 CLI 与 TCP/Qt 已共用真实组件流水线；窗口、回传和播放器状态已有 x86/WSLg 验证。
 FakeVehicle 空调/左前车窗开关及 2.5D 回执驱动界面已接入；CLI 与 Qt 各固定 5×3 次
@@ -90,22 +101,26 @@ bash agent/scripts/voice_demo.sh stop
 这是本机开发启停工具，不提供生产进程管理或原子 PID 身份保证；记录损坏、身份不符
 或磁盘写入失败时需要人工检查，不要随意删除仍存活进程的 PID 文件。
 
-需要单独调试前后端时，仍可在两个 WSL 终端直接运行同一组二进制：
+当前单独调试前后端时，须先准备 RAG 依赖、UP 的 vcan0 与独立 ECU，再运行同一组二进制（下列追加参数后的命令未单独手工执行，服务等价启动/退出见 RAG 恢复记录）：
 
 ```bash
 cd /home/projects/CabinFlow
 runtime/build/voice-demo/voice_demo_server 127.0.0.1 39001 \
   agent/voice/models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16 \
   runtime/build/models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf \
-  runtime/build/models/vits-melo-tts-zh_en
+  runtime/build/models/vits-melo-tts-zh_en \
+  /home/projects/CabinFlow/runtime/build/inference/rag-python/venv/lib/python3.12/site-packages \
+  /home/projects/CabinFlow/runtime/build/models/text2vec-base-chinese/hf \
+  /home/projects/CabinFlow/agent/automotive_edge_rag/python/vector_db
 ```
 
 ```bash
 cd /home/projects/CabinFlow
-QT_QPA_PLATFORM=wayland runtime/build/voice-demo/frontend/voice_demo_ui 127.0.0.1 39001
+QT_QPA_PLATFORM=wayland runtime/build/voice-demo/frontend/voice_demo_ui 127.0.0.1 39001 \
+  /home/projects/CabinFlow/runtime/build/models/wake
 ```
 
-后端命令已实际执行；以下 live probe 用同一 VoiceClient/QML 窗口实际
+2026-10-03 的旧接口后端命令已实际执行；以下历史 live probe 用同一 VoiceClient/QML 窗口实际
 驱动输入和播放。上述直接 UI 启动命令尚未另外手工操作一轮。服务退出用 Ctrl+C 或
 SIGTERM；模型调用若未返回，仍等待清理，不以强制杀进程冒充正常退出。
 
@@ -121,7 +136,7 @@ cmake -S agent/apps/voice_demo -B runtime/build/voice-demo \
 cmake --build runtime/build/voice-demo -j4
 ```
 
-本轮实际文本演示命令；再次运行必须换一个从未存在的输出目录：
+2026-10-02 历史文本演示命令（不是当前参数合同，重现当前版须追加上述三个绝对 RAG 路径）；历史证据的目录不能覆盖：
 
 ```bash
 runtime/build/voice-demo/voice_demo --text '中国的首都是哪里？' \

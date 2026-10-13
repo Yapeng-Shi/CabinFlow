@@ -1,6 +1,8 @@
 #pragma once
 
 #include <functional>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,6 +21,19 @@ struct BackendResult {
 };
 
 struct WavAudio { std::string bytes; };
+
+struct RagDocument {
+    std::uint32_t id{0};
+    std::string section;
+    std::string subsection;
+    std::string text;
+    float similarity{0};
+};
+
+struct RagSearchResult {
+    // 无命中是成功完成检索但没有资料，与模型故障、取消和 LLM 回答分开。
+    std::optional<RagDocument> match;
+};
 using CancellationCheck = std::function<bool()>;
 
 // 端口只使用拥有数据的标准类型；SDK 对象、分词器和模型参数不跨过该边界。
@@ -36,6 +51,13 @@ public:
     virtual ~LlmBackend() = default;
     virtual BackendResult<std::string> generate(
         std::string_view text, const CancellationCheck& cancelled) = 0;
+};
+
+class RagBackend {
+public:
+    virtual ~RagBackend() = default;
+    virtual BackendResult<RagSearchResult> search(
+        std::string_view query, const CancellationCheck& cancelled) = 0;
 };
 
 class TtsBackend {

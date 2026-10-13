@@ -122,8 +122,8 @@ DecodeResult decode_message(const std::string& bytes) {
         return result;
     }
 
-    envelope.schema_version =
-        static_cast<std::uint16_t>(wire_message.schema_version());
+    // 保留 wire uint32 原值，未知版本交由 validator 拒绝，不能窄化成当前版本。
+    envelope.schema_version = wire_message.schema_version();
     envelope.message_id = wire_message.message_id();
     envelope.trace_id = wire_message.trace_id();
     envelope.session_id = wire_message.session_id();

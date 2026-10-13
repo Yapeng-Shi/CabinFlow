@@ -4,7 +4,7 @@ target_include_directories(cabinflow_voice_pipeline PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../inference/include)
 target_link_libraries(cabinflow_voice_pipeline PUBLIC
-    CabinFlow::Runtime CabinFlow::Gateway CabinFlow::FakeVehicle CabinFlow::AgentProtocol
+    CabinFlow::Runtime CabinFlow::Gateway CabinFlow::Vehicle CabinFlow::AgentProtocol
     PRIVATE
     CabinFlow::DialogueTextNode CabinFlow::TransportInMemory)
 target_compile_features(cabinflow_voice_pipeline PUBLIC cxx_std_17)

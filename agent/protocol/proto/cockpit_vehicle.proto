@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package cabinflow.agent.v1;
+
+// 车辆状态只由 VoiceTaskResult.vehicle 携带，避免两个状态来源。
+message VehicleStatusRequest {}
+message VehicleStatusResponse {}

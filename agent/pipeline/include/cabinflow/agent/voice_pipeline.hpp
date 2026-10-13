@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include <cabinflow/agent/fake_vehicle.hpp>
+#include <cabinflow/agent/vehicle_backend.hpp>
 #include <cockpit_text.pb.h>
 #include <cabinflow/agent/inference/backends.hpp>
 #include <cabinflow/gateway/control_gateway.hpp>
@@ -15,9 +15,9 @@ enum class VoiceStatus { kCompleted, kFailed, kCancelled, kBusy };
 
 struct VehicleReceipt {
     bool simulated;
-    bool climate_on;
-    bool action_applied;
-    bool left_front_window_open;
+    std::optional<bool> climate_on;
+    std::optional<bool> action_applied;
+    std::optional<bool> left_front_window_open;
 };
 
 struct VoiceResult {
@@ -32,6 +32,7 @@ struct VoiceResult {
     inference::WavAudio audio;
     std::optional<VehicleReceipt> vehicle;
     std::optional<v1::MusicCommand> music_command;
+    bool vehicle_status{false};
 };
 
 // 编排拥有模型，Runtime 拥有独立 Target 队列/worker；UI/CLI 不包含 SDK 类型。
@@ -39,15 +40,17 @@ struct VoiceResult {
 class VoicePipeline final {
 public:
     VoicePipeline(std::unique_ptr<inference::AsrBackend> asr,
+                  std::unique_ptr<inference::RagBackend> rag,
                   std::unique_ptr<inference::LlmBackend> llm,
                   std::unique_ptr<inference::TtsBackend> tts,
-                  std::unique_ptr<FakeVehicle> vehicle);
+                  std::unique_ptr<VehicleBackend> vehicle);
     ~VoicePipeline();
     VoicePipeline(const VoicePipeline&) = delete;
     VoicePipeline& operator=(const VoicePipeline&) = delete;
 
     [[nodiscard]] VoiceResult run_text(std::string text);
     [[nodiscard]] VoiceResult run_wav(inference::WavAudio audio);
+    [[nodiscard]] VoiceResult refresh_vehicle_state();
     // true 只表示取消请求被接受，不表示 SDK 调用已经退出。
     [[nodiscard]] bool cancel();
 
@@ -61,7 +64,7 @@ public:
 private:
     struct State;
     std::unique_ptr<State> state_;
-    VoiceResult run(bool audio_input, std::string input);
+    VoiceResult run(bool audio_input, std::string input, bool status_query = false);
 };
 
 }  // namespace cabinflow::agent

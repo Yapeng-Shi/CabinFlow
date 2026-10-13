@@ -2,6 +2,12 @@
 
 ## Runtime build and test
 
+The external Gateway now requires Ubuntu packages `libgrpc++-dev` and
+`protobuf-compiler-grpc` in addition to Protobuf and ZeroMQ development files.
+Runtime Core still has no gRPC or cockpit payload dependency. For the current
+Qt/CAN app, environment prerequisites and sanitizer limitations are recorded in
+[the migration record](../../agent/docs/grpc-can-migration-20261006.md).
+
 The monorepo root has no CMake entry point. Run the canonical CMake presets
 from `runtime/`; historical modules remain migration input until their
 dependencies and behavior have been characterized.
@@ -107,15 +113,15 @@ cmake --build build/linux-debug --target bounded_queue_stress_test
 ./build/linux-debug/tests/bounded_queue_stress_test
 ```
 
-## Typed TCP data plane
+## Typed gRPC data plane
 
 `TargetNode` is Runtime's generic data-plane interface. Runtime owns a unique
 target-name mapping, a bounded queue, and one worker for each target. Gateway
 reserves a target slot before it admits the envelope to `SessionLedger`; only
 an accepted envelope is committed to the queue. Payload parsing remains in the
 Agent node, so Runtime and Gateway do not link `CabinFlow::AgentProtocol`.
-All external TCP data targets must match the Unit owning their work; internal
-Runtime delivery can cross Targets within that work. The TCP test verifies that
+All external gRPC data targets must match the Unit owning their work; internal
+Runtime delivery can cross Targets within that work. The gRPC test verifies that
 an owner rejection does not consume message identity or final state in Ledger.
 
 The first Agent path is `cockpit.text.input -> dialogue.primary ->
@@ -123,15 +129,15 @@ cockpit.text.output`. It uses a
 Protobuf `TextInput`; empty, malformed, invalid UTF-8, or unsupported-topic
 messages receive typed `runtime.delivery.error` responses. Successful handling
 does not receive an ACK. A final input produces a typed `TextOutput` on the
-TCP connection that sent that exact input message; this rule-based recognition
+gRPC stream that sent that exact input message; this rule-based recognition
 does not execute vehicle controls or real ASR/LLM/TTS. Control requests use
 the client's and Gateway's shared monotonic clock domain for TTL validation.
-The direct Runtime, response-contract, and real TCP
+The direct Runtime, response-contract, and real gRPC
 checks are included in default CTest as `target_runtime_contract_test`,
-`delivery_error_contract_test`, and `data_plane_gateway_tcp_test`.
+`delivery_error_contract_test`, and `data_plane_gateway_grpc_test`.
 
 The real-model Agent application adds one opaque final-task completion hook at
-Gateway assembly. Its Qt/TCP path returns `cockpit.task.result`, not intermediate
+Gateway assembly. Its Qt/gRPC path returns `cockpit.task.result`, not intermediate
 stage output. It keeps Gateway alive while the application cancels and drains
 the root and downstream handlers, then stops Runtime and Gateway from external
 control/owner threads. This is the current synchronous Agent contract, not a
@@ -151,7 +157,7 @@ wall-clock time, node, trace/session/work/message identity, status, and detail.
 One invocation shows two concurrent sessions, duplicate input, stale sequence,
 deadline, work cancellation with an unaffected sibling work, and post-final
 rejection. `runtime_demo_integration` asserts every scenario from the same
-binary; its output is not a real model or TCP Gateway demonstration.
+binary; its output is not a real model or gRPC Gateway demonstration.
 
 ## Sanitizers
 

@@ -64,10 +64,18 @@ target_link_libraries(message_codec_test PRIVATE CabinFlow::Protocol)
 
 add_test(NAME message_codec_test COMMAND message_codec_test)
 
-add_executable(gateway_framer_contract_test contract/gateway_framer_contract_test.cpp)
+# 旧分帧器仅保留为 characterization input，不链接进生产 Gateway。
+add_executable(gateway_framer_contract_test contract/gateway_framer_contract_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gateway/src/runtime_message_framer.cpp)
 target_link_libraries(gateway_framer_contract_test PRIVATE CabinFlow::Gateway)
 
 add_test(NAME gateway_framer_contract_test COMMAND gateway_framer_contract_test)
+
+add_executable(grpc_stream_contract_test contract/grpc_stream_contract_test.cpp)
+target_link_libraries(grpc_stream_contract_test PRIVATE CabinFlow::Gateway)
+target_include_directories(grpc_stream_contract_test PRIVATE ${PROJECT_SOURCE_DIR}/gateway/src)
+add_test(NAME grpc_stream_contract_test COMMAND grpc_stream_contract_test)
+set_tests_properties(grpc_stream_contract_test PROPERTIES TIMEOUT 30)
 
 add_executable(control_plane_contract_test contract/control_plane_contract_test.cpp)
 target_link_libraries(control_plane_contract_test PRIVATE CabinFlow::Gateway)
@@ -100,17 +108,18 @@ target_include_directories(target_runtime_contract_test
 
 add_test(NAME target_runtime_contract_test COMMAND target_runtime_contract_test)
 
-add_executable(control_gateway_tcp_test integration/control_gateway_tcp_test.cpp)
-target_link_libraries(control_gateway_tcp_test
+add_executable(control_gateway_grpc_test integration/control_gateway_grpc_test.cpp)
+target_include_directories(control_gateway_grpc_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
+target_link_libraries(control_gateway_grpc_test
     PRIVATE
         CabinFlow::Gateway
         CabinFlow::TransportInMemory
 )
 
-add_test(NAME control_gateway_tcp_test COMMAND control_gateway_tcp_test)
+add_test(NAME control_gateway_grpc_test COMMAND control_gateway_grpc_test)
 
-add_executable(data_plane_gateway_tcp_test integration/data_plane_gateway_tcp_test.cpp)
-target_link_libraries(data_plane_gateway_tcp_test
+add_executable(data_plane_gateway_grpc_test integration/data_plane_gateway_grpc_test.cpp)
+target_link_libraries(data_plane_gateway_grpc_test
     PRIVATE
         CabinFlow::Runtime
         CabinFlow::Gateway
@@ -118,12 +127,12 @@ target_link_libraries(data_plane_gateway_tcp_test
         CabinFlow::DialogueTextNode
         CabinFlow::TransportInMemory
 )
-target_include_directories(data_plane_gateway_tcp_test
+target_include_directories(data_plane_gateway_grpc_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/support
 )
 
-add_test(NAME data_plane_gateway_tcp_test COMMAND data_plane_gateway_tcp_test)
+add_test(NAME data_plane_gateway_grpc_test COMMAND data_plane_gateway_grpc_test)
 
 add_executable(session_ledger_test unit/core/session_ledger_test.cpp)
 target_link_libraries(session_ledger_test PRIVATE CabinFlow::Runtime)

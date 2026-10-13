@@ -1,5 +1,20 @@
 # CabinFlow Runtime 能力迁移账本
 
+> 2026-10-06 当前入口更新：外部 Gateway 已直接迁移为 gRPC 双向 RuntimeMessage 流；
+> 旧 TCP framer 只作为测试输入。下文 TCP 测试结果属于迁移前历史证据，不自动换名为 gRPC 验收。
+> 新测试为 `control_gateway_grpc_test` / `data_plane_gateway_grpc_test` / `voice_gateway_grpc_test`；
+> 本轮状态仍为 migrating，详见 [迁移记录](../../agent/docs/grpc-can-migration-20261006.md)。
+
+## 2026-10-06 当前接入迁移增量
+
+| 能力 | 唯一当前实现 | 证据 | 状态 |
+|---|---|---|---|
+| 外部控制/数据接入 | loopback gRPC 双向 RuntimeMessage；保留 validator/ControlService/准入规则 | Debug 全量 37/37；schema uint32 边界、真实流/队列八条/并发断连；相关 ASan 通过，TSan 交接报告未排除 | migrating |
+| Agent 车辆回执 | SocketCAN/vcan0 + 独立 ECU；非 Runtime 业务接口 | 2026-10-07 匹配内核启动、真实 vcan 集成/限定 CAN ASan/TSan、模型/Qt/gRPC 回执闭环通过；[环境与证据](../../agent/docs/wsl-vcan-20261007.md)。不是物理 CAN 验证 | Agent 扩展，非 Runtime 收尾证明 |
+
+旧 framer 仅作为 characterization 测试输入；旧通用 `net/` TCP 能力保留，
+不能因更换应用 Gateway 就删除 Reactor/TCP 基础库或宣布旧控制面迁移整体完成。
+
 ## 目的与边界
 
 本账本以可验证的能力为迁移单位，而非以历史目录为迁移单位。`infra-controller/`、`unit-manager/`、`network/` 与 `hybrid-comm/` 是当前迁移输入材料：它们不接入顶层 CMake，也不能被当作新 Runtime 已经实现过的证据。

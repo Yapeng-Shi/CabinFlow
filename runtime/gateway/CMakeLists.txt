@@ -7,7 +7,7 @@ add_library(cabinflow_gateway
     src/delivery_error_builder.cpp
     src/message_id.cpp
     src/response_sequencer.cpp
-    src/runtime_message_framer.cpp
+    src/grpc_connection.cpp
 )
 add_library(CabinFlow::Gateway ALIAS cabinflow_gateway)
 
@@ -20,7 +20,7 @@ target_link_libraries(cabinflow_gateway
     PUBLIC
         CabinFlow::Protocol
         CabinFlow::Runtime
-        CabinFlow::Net
+        CabinFlow::GrpcProtocol
 )
 
 target_compile_features(cabinflow_gateway PUBLIC cxx_std_17)

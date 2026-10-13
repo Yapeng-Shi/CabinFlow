@@ -7,7 +7,7 @@
 
 namespace cabinflow::protocol {
 
-inline constexpr std::uint16_t kCurrentSchemaVersion = 1;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 1;
 
 enum class SeatPosition {
     kUnknown,
@@ -22,7 +22,7 @@ enum class SeatPosition {
 // intentionally outside this type so the same envelope can be used by ZMQ,
 // IPC, and future vehicle-service adapters.
 struct MessageEnvelope {
-    std::uint16_t schema_version{kCurrentSchemaVersion};
+    std::uint32_t schema_version{kCurrentSchemaVersion};
     std::string message_id;
     std::string trace_id;
     std::string session_id;

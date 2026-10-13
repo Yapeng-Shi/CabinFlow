@@ -4,6 +4,7 @@ package cabinflow.agent.v1;
 
 import "cockpit_audio.proto";
 import "cockpit_text.proto";
+import "cockpit_vehicle.proto";
 
 message TaskFailure {
   string message = 1;
@@ -16,8 +17,8 @@ message TaskCancelled {
 // 模拟执行事实独立于语音结局：动作后的取消或 TTS 失败不回滚车辆状态。
 message VehicleResult {
   bool simulated = 1;
-  bool climate_on = 2;
-  bool action_applied = 3;
+  optional bool climate_on = 2;
+  optional bool action_applied = 3;
   // false 必须与未提供区分；所有准入后的终态写入，消费者拒绝缺失，不猜测“关闭”。
   optional bool left_front_window_open = 4;
 }
@@ -34,6 +35,7 @@ message VoiceTaskResult {
     TaskFailure failed = 5;
     TaskCancelled cancelled = 6;
     MusicCommand music_command = 8;
+    VehicleStatusResponse vehicle_status = 9;
   }
 
   VehicleResult vehicle = 7;

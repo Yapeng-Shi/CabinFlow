@@ -17,10 +17,10 @@
 #include <cabinflow/gateway/control_service.hpp>
 #include <cabinflow/gateway/data_envelope_validator.hpp>
 #include <cabinflow/gateway/delivery_error_builder.hpp>
-#include <cabinflow/gateway/runtime_message_framer.hpp>
-#include <cabinflow/net/event_loop.hpp>
-#include <cabinflow/net/tcp_connection.hpp>
-#include <cabinflow/net/tcp_server.hpp>
+#include <cabinflow/gateway/message_limits.hpp>
+#include <cabinflow/protocol/message_codec.hpp>
+#include "grpc_connection.hpp"
+#include <chrono>
 #include <cabinflow/runtime/clock.hpp>
 #include <cabinflow/runtime/runtime.hpp>
 #include <cabinflow/runtime/unit_registry.hpp>
@@ -152,11 +152,12 @@ struct DeliveryErrorResponder final {
     void start_accepting() noexcept { accepting.store(true); }
     void stop_accepting() noexcept { accepting.store(false); }
 
-    void send(const net::TcpConnectionPtr& connection,
+    void send(const GrpcConnectionPtr& connection,
               const protocol::Message& request,
               protocol::v1::DeliveryErrorCode code,
               std::string_view detail,
               bool close_after_response = false) const {
+        std::lock_guard<std::mutex> response_lock(connection->response_mutex);
         if (!accepting.load() || !connection->connected()) {
             return;
         }
@@ -165,18 +166,13 @@ struct DeliveryErrorResponder final {
             connection->force_close();
             return;
         }
-        const auto frame = RuntimeMessageFramer::encode(response.message);
-        if (!frame) {
+        const auto frame = protocol::encode_message(response.message);
+        if (!frame || frame.bytes.size() > kMaxMessageBytes) {
             connection->force_close();
             return;
         }
 
-        try {
-            connection->send(frame.bytes);
-        } catch (const std::logic_error&) {
-            // 连接可能恰好在 worker 回报失败时关闭；此时没有安全的响应接收方。
-            return;
-        }
+        static_cast<void>(connection->send(response.message));
         if (close_after_response) {
             connection->shutdown();
         }
@@ -190,12 +186,11 @@ struct DeliveryErrorResponder final {
 struct ControlGateway::Impl {
     struct ConnectionState {
         std::mutex mutex;
-        RuntimeMessageFramer framer;
     };
 
     struct PendingOutputs {
         struct Destination {
-            std::weak_ptr<net::TcpConnection> connection;
+            std::weak_ptr<GrpcConnection> connection;
             std::string connection_name;
         };
 
@@ -203,28 +198,22 @@ struct ControlGateway::Impl {
         std::map<std::pair<std::string, std::string>, Destination> destinations;
     };
 
-    Impl(net::EventLoop& loop_arg, std::string name, std::string listen_ip,
-         std::uint16_t listen_port, runtime::UnitRegistry& registry,
-         runtime::Runtime& runtime,
+    Impl(std::string name, std::string listen_ip, std::uint16_t listen_port,
+         runtime::UnitRegistry& registry, runtime::Runtime& runtime,
          const runtime::Clock& clock, std::uint32_t response_ttl_ms)
-        : registry(registry),
-          runtime(runtime),
-          clock(clock),
-          response_ttl_ms(response_ttl_ms),
-          delivery_responder(std::make_shared<DeliveryErrorResponder>(
-              clock, response_ttl_ms)),
-          validator(clock),
-          service(registry),
+        : registry(registry), runtime(runtime), clock(clock), response_ttl_ms(response_ttl_ms),
+          delivery_responder(std::make_shared<DeliveryErrorResponder>(clock, response_ttl_ms)),
+          validator(clock), service(registry),
           response_builder(clock, delivery_responder->sequencer, response_ttl_ms),
-          server(loop_arg, std::move(name), std::move(listen_ip), listen_port) {
-        server.set_connection_callback(
-            [this](const net::TcpConnectionPtr& connection) {
-                handle_connection(connection);
-            });
-        server.set_message_callback(
-            [this](const net::TcpConnectionPtr& connection, std::string_view bytes) {
-                handle_message(connection, bytes);
-            });
+          listen_address(listen_ip + ":" + std::to_string(listen_port)) {
+        if ((listen_ip != "127.0.0.1" && listen_ip != "::1") || name.empty())
+            throw std::invalid_argument("gRPC demo requires explicit loopback IP and gateway name");
+        if (listen_ip == "::1") listen_address = "[::1]:" + std::to_string(listen_port);
+        grpc_service = std::make_unique<GrpcService>(std::move(name),
+            [this](const GrpcConnectionPtr& connection, const protocol::Message& message) {
+                handle_message(connection, message);
+            },
+            [this](const GrpcConnectionPtr& connection) { handle_connection(connection); });
     }
 
     ~Impl() {
@@ -232,7 +221,7 @@ struct ControlGateway::Impl {
         delivery_responder->stop_accepting();
     }
 
-    void handle_connection(const net::TcpConnectionPtr& connection) {
+    void handle_connection(const GrpcConnectionPtr& connection) {
         {
             std::lock_guard<std::mutex> lock(connections_mutex);
             if (connection->connected()) {
@@ -276,6 +265,8 @@ struct ControlGateway::Impl {
             return false;
         }
 
+        std::lock_guard<std::mutex> response_lock(connection->response_mutex);
+
         const auto sequence = delivery_responder->sequencer.next(
             request.session_id, request.work_id, topic, connection->name());
         const auto message_id = generate_gateway_message_id(kDataOutputIdPrefix);
@@ -301,44 +292,38 @@ struct ControlGateway::Impl {
         envelope.ttl_ms = response_ttl_ms;
         envelope.is_final = true;
         response.payload = std::move(payload);
-        const auto frame = RuntimeMessageFramer::encode(response);
+        const auto frame = protocol::encode_message(response);
         pending_outputs->destinations.erase(found);
-        if (!frame) {
+        if (!frame || frame.bytes.size() > kMaxMessageBytes) {
             return false;
         }
-        try {
-            // 序号分配与入发送队列共用同一锁，保持同一响应流的线上顺序。
-            connection->send(frame.bytes);
-        } catch (const std::logic_error&) {
-            return false;
-        }
-        return true;
+        return connection->send(response);
     }
 
     [[nodiscard]] std::shared_ptr<ConnectionState> find_connection_state(
-        const net::TcpConnectionPtr& connection) {
+        const GrpcConnectionPtr& connection) {
         std::lock_guard<std::mutex> lock(connections_mutex);
         const auto found = connections.find(connection->name());
         return found == connections.end() ? nullptr : found->second;
     }
 
-    void send_encoded_response(const net::TcpConnectionPtr& connection,
+    void send_encoded_response(const GrpcConnectionPtr& connection,
                                const protocol::Message& response,
                                bool close_after_response) {
-        const auto frame = RuntimeMessageFramer::encode(response);
-        if (!frame) {
+        const auto frame = protocol::encode_message(response);
+        if (!frame || frame.bytes.size() > kMaxMessageBytes) {
             connection->force_close();
             return;
         }
 
-        connection->send(frame.bytes);
+        static_cast<void>(connection->send(response));
         if (close_after_response) {
-            // TcpConnection 会在既有发送缓冲写尽后 half-close，避免丢失 schema 错误。
+            // 在错误响应的写反应完成后结束流，不能与在途写并发 Finish。
             connection->shutdown();
         }
     }
 
-    void send_response(const net::TcpConnectionPtr& connection,
+    void send_response(const GrpcConnectionPtr& connection,
                        const ControlResponseBuildResult& response,
                        bool close_after_response) {
         if (!response) {
@@ -348,8 +333,9 @@ struct ControlGateway::Impl {
         send_encoded_response(connection, response.message, close_after_response);
     }
 
-    void process_control_message(const net::TcpConnectionPtr& connection,
+    void process_control_message(const GrpcConnectionPtr& connection,
                                  const protocol::Message& message) {
+        std::lock_guard<std::mutex> response_lock(connection->response_mutex);
         auto validation = validator.validate(message);
         if (!validation) {
             if (!validation.can_return_error || !validation.request.has_value()) {
@@ -383,7 +369,7 @@ struct ControlGateway::Impl {
         send_response(connection, response, false);
     }
 
-    void process_data_message(const net::TcpConnectionPtr& connection,
+    void process_data_message(const GrpcConnectionPtr& connection,
                               const protocol::Message& message) {
         const auto validation = data_validator.validate(message);
         if (!validation) {
@@ -487,7 +473,7 @@ struct ControlGateway::Impl {
                 "final input message ID already has a pending destination");
             return;
         }
-        const std::weak_ptr<net::TcpConnection> weak_connection = connection;
+        const std::weak_ptr<GrpcConnection> weak_connection = connection;
         const std::weak_ptr<DeliveryErrorResponder> weak_responder = delivery_responder;
         const auto task_failure = std::make_shared<
             std::optional<runtime::Runtime::TargetDeliveryFailure>>();
@@ -543,7 +529,7 @@ struct ControlGateway::Impl {
         }
     }
 
-    void process_message(const net::TcpConnectionPtr& connection,
+    void process_message(const GrpcConnectionPtr& connection,
                          const protocol::Message& message) {
         if (message.envelope.topic == "control.request") {
             process_control_message(connection, message);
@@ -552,23 +538,13 @@ struct ControlGateway::Impl {
         process_data_message(connection, message);
     }
 
-    void handle_message(const net::TcpConnectionPtr& connection,
-                        std::string_view bytes) {
-        const auto connection_state = find_connection_state(connection);
-        if (!connection_state) {
-            connection->force_close();
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(connection_state->mutex);
-        const auto framed = connection_state->framer.feed(bytes);
-        for (const auto& message : framed.messages) {
-            process_message(connection, message);
-        }
-        if (!framed) {
-            // 非法长度或 RuntimeMessage Protobuf 损坏没有可信关联身份，直接关闭。
-            connection->force_close();
-        }
+    void handle_message(const GrpcConnectionPtr& connection, const protocol::Message& message) {
+        const auto state = find_connection_state(connection);
+        if (!state) { connection->force_close(); return; }
+        // 只串行化同一流的准入；不持有 reactor 锁进入业务回调。
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!admission_accepting.load()) { connection->shutdown(); return; }
+        process_message(connection, message);
     }
 
     std::mutex connections_mutex;
@@ -586,24 +562,20 @@ struct ControlGateway::Impl {
     DataTaskHooks task_hooks;
     bool started{false};
     ControlResponseBuilder response_builder;
-    net::TcpServer server;
+    std::atomic<bool> admission_accepting{false};
+    std::string listen_address;
+    int port{0};
+    std::unique_ptr<GrpcService> grpc_service;
+    std::unique_ptr<grpc::Server> server;
 };
 
-ControlGateway::ControlGateway(net::EventLoop& loop, std::string name,
-                               std::string listen_ip, std::uint16_t listen_port,
-                               runtime::UnitRegistry& registry,
-                               runtime::Runtime& runtime,
-                               const runtime::Clock& clock,
+ControlGateway::ControlGateway(std::string name, std::string listen_ip,
+                               std::uint16_t listen_port, runtime::UnitRegistry& registry,
+                               runtime::Runtime& runtime, const runtime::Clock& clock,
                                std::uint32_t response_ttl_ms)
-    : impl_(std::make_unique<Impl>(loop, std::move(name), std::move(listen_ip),
-                                   listen_port, registry, runtime, clock,
-                                   response_ttl_ms)) {}
-
-ControlGateway::~ControlGateway() = default;
-
-void ControlGateway::set_worker_count(std::size_t worker_count) {
-    impl_->server.set_worker_count(worker_count);
-}
+    : impl_(std::make_unique<Impl>(std::move(name), std::move(listen_ip), listen_port,
+                                   registry, runtime, clock, response_ttl_ms)) {}
+ControlGateway::~ControlGateway() { stop(); }
 
 void ControlGateway::set_data_task_hooks(DataTaskHooks hooks) {
     if (impl_->started || !hooks.try_reserve || !hooks.rollback ||
@@ -614,23 +586,33 @@ void ControlGateway::set_data_task_hooks(DataTaskHooks hooks) {
 }
 
 void ControlGateway::start() {
+    if (impl_->started) throw std::logic_error("gRPC gateway is a one-shot instance");
     impl_->started = true;
+    grpc::ServerBuilder builder;
+    builder.SetMaxReceiveMessageSize(static_cast<int>(kMaxMessageBytes));
+    builder.SetMaxSendMessageSize(static_cast<int>(kMaxMessageBytes));
+    builder.AddListeningPort(impl_->listen_address, grpc::InsecureServerCredentials(), &impl_->port);
+    builder.RegisterService(impl_->grpc_service.get());
+    impl_->server = builder.BuildAndStart();
+    if (!impl_->server || impl_->port == 0) throw std::runtime_error("gRPC listen failed");
     impl_->output_accepting.store(true);
     impl_->delivery_responder->start_accepting();
-    impl_->server.start();
+    impl_->admission_accepting.store(true);
 }
-
+void ControlGateway::stop_admission() { impl_->admission_accepting.store(false); }
 void ControlGateway::stop() {
+    stop_admission();
+    if (!impl_->server) return;
     impl_->output_accepting.store(false);
     impl_->delivery_responder->stop_accepting();
-    impl_->server.stop();
+    // 期限只用于网络流收敛；调用方须在此之前完成 Runtime drain，不能强杀算法线程。
+    impl_->server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    impl_->server->Wait();
+    impl_->server.reset();
     std::lock_guard<std::mutex> lock(impl_->pending_outputs->mutex);
     impl_->pending_outputs->destinations.clear();
 }
-
-std::uint16_t ControlGateway::bound_port() const {
-    return impl_->server.bound_port();
-}
+std::uint16_t ControlGateway::bound_port() const { return static_cast<std::uint16_t>(impl_->port); }
 
 bool ControlGateway::send_data_output(
     const protocol::MessageEnvelope& request, std::string_view topic,
@@ -653,7 +635,8 @@ bool ControlGateway::data_output_fits(
     envelope.ttl_ms = std::numeric_limits<std::uint32_t>::max();
     envelope.is_final = true;
     response.payload = output.payload;
-    return static_cast<bool>(RuntimeMessageFramer::encode(response));
+    const auto encoded = protocol::encode_message(response);
+    return encoded && encoded.bytes.size() <= kMaxMessageBytes;
 }
 
 }  // namespace cabinflow::gateway

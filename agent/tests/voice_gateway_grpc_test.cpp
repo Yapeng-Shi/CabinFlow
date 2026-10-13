@@ -1,7 +1,6 @@
 #include <cabinflow/agent/voice_pipeline.hpp>
 #include <cabinflow/agent/fake_vehicle.hpp>
-#include <cabinflow/gateway/runtime_message_framer.hpp>
-#include <cabinflow/net/event_loop.hpp>
+#include "../../runtime/tests/support/grpc_test_client.hpp"
 #include <cabinflow/runtime/unit_registry.hpp>
 #include <cockpit_audio.pb.h>
 #include <cockpit_task.pb.h>
@@ -9,10 +8,6 @@
 #include <control.pb.h>
 #include <delivery.pb.h>
 
-#include <arpa/inet.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
@@ -35,6 +30,8 @@ struct Evidence {
     std::condition_variable changed;
     bool block{false}, entered{false}, release{false};
     bool fail_tts{false};
+    bool fail_rag{false};
+    std::optional<RagDocument> rag_match;
     std::atomic<unsigned> llm_calls{0};
     std::atomic<unsigned> tts_calls{0};
 };
@@ -42,6 +39,16 @@ class Asr final : public AsrBackend {
     BackendResult<std::string> transcribe(std::string_view, const CancellationCheck&) override {
         return {"识别的问题", BackendError::kNone, {}};
     }
+};
+class Rag final : public RagBackend {
+public:
+    explicit Rag(Evidence& evidence) : evidence_(evidence) {}
+    BackendResult<RagSearchResult> search(std::string_view, const CancellationCheck&) override {
+        if (evidence_.fail_rag) return {{}, BackendError::kInferenceFailed, "test RAG failure"};
+        return {{evidence_.rag_match}, BackendError::kNone, {}}; // 显式测试结果，不用于生产。
+    }
+private:
+    Evidence& evidence_;
 };
 class Llm final : public LlmBackend {
 public:
@@ -73,31 +80,20 @@ private:
 };
 class Fixture {
 public:
-    Fixture() : pipeline(std::make_unique<Asr>(), std::make_unique<Llm>(evidence), std::make_unique<Tts>(evidence),
+    Fixture() : pipeline(std::make_unique<Asr>(), std::make_unique<Rag>(evidence), std::make_unique<Llm>(evidence), std::make_unique<Tts>(evidence),
                          std::make_unique<cabinflow::agent::FakeVehicle>(false, false)) {
-        auto ready = std::make_shared<std::promise<void>>();
-        auto result = ready->get_future();
-        thread_ = std::thread([this, ready] {
-            cabinflow::net::EventLoop loop;
-            loop_ = &loop;
-            gateway_ = std::make_unique<cabinflow::gateway::ControlGateway>(loop, "voice-test", "127.0.0.1", 0,
-                pipeline.registry(), pipeline.runtime(), pipeline.clock(), 300'000);
-            gateway_->set_data_task_hooks(pipeline.hooks());
-            gateway_->start();
-            port_ = gateway_->bound_port();
-            ready->set_value();
-            loop.loop();
-            gateway_->stop();
-            gateway_.reset();
-        });
-        result.get();
+        gateway_ = std::make_unique<cabinflow::gateway::ControlGateway>("voice-test", "127.0.0.1", 0,
+            pipeline.registry(), pipeline.runtime(), pipeline.clock(), 300'000);
+        gateway_->set_data_task_hooks(pipeline.hooks());
+        gateway_->start();
+        port_ = gateway_->bound_port();
     }
     ~Fixture() {
         // 断言失败也先释放 SDK 屏障；Gateway 必须活到根 completion/drain 之后。
         release();
         pipeline.shutdown();
-        loop_->quit();
-        thread_.join();
+        gateway_->stop();
+        gateway_.reset();
     }
     void release() {
         { std::lock_guard<std::mutex> lock(evidence.mutex); evidence.release = true; }
@@ -107,60 +103,16 @@ public:
     Evidence evidence;
     cabinflow::agent::VoicePipeline pipeline;
 private:
-    cabinflow::net::EventLoop* loop_{nullptr};
     std::unique_ptr<cabinflow::gateway::ControlGateway> gateway_;
     std::uint16_t port_{0};
-    std::thread thread_;
 };
-class Client {
-public:
-    explicit Client(std::uint16_t port) : fd_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP)) {
-        require(fd_ >= 0, "create TCP socket");
-        sockaddr_in address{};
-        address.sin_family = AF_INET; address.sin_port = htons(port);
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        require(::connect(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "connect TCP gateway");
-    }
-    ~Client() { ::close(fd_); }
-    void send(const Message& message) {
-        const auto frame = cabinflow::gateway::RuntimeMessageFramer::encode(message);
-        require(static_cast<bool>(frame), "encode request frame");
-        for (std::size_t sent = 0; sent < frame.bytes.size();) {
-            const auto count = ::send(fd_, frame.bytes.data() + sent, frame.bytes.size() - sent, MSG_NOSIGNAL);
-            require(count > 0, "send request"); sent += static_cast<std::size_t>(count);
-        }
-    }
-    Message read() {
-        const auto header = exact(4);
-        std::uint32_t length = 0;
-        for (unsigned char byte : header) length = (length << 8U) | byte;
-        require(length > 0 && length <= cabinflow::gateway::kMaxFrameBytes, "response length within frame limit");
-        cabinflow::gateway::RuntimeMessageFramer framer;
-        auto result = framer.feed(header + exact(length));
-        require(result && result.messages.size() == 1, "decode one response");
-        return result.messages.front();
-    }
-    void no_response() {
-        pollfd p{fd_, POLLIN, 0}; require(::poll(&p, 1, 50) == 0, "no ACK or premature task result");
-    }
-private:
-    std::string exact(std::size_t length) {
-        std::string bytes(length, '\0');
-        for (std::size_t used = 0; used < length;) {
-            pollfd p{fd_, POLLIN, 0}; require(::poll(&p, 1, 2000) == 1 && (p.revents & POLLIN), "response timeout");
-            const auto count = ::recv(fd_, bytes.data() + used, length - used, 0);
-            require(count > 0, "connection closed before response"); used += static_cast<std::size_t>(count);
-        }
-        return bytes;
-    }
-    int fd_;
-};
+using Client = cabinflow::test::GrpcTestClient;
 Message envelope(std::string id, std::string session, std::string work, std::string target, std::string topic) {
     Message message;
     auto& e = message.envelope;
     e.message_id = std::move(id); e.trace_id = "trace:" + e.message_id;
     e.session_id = std::move(session); e.work_id = std::move(work);
-    e.source_node = "tcp.client"; e.target_node = std::move(target); e.topic = std::move(topic);
+    e.source_node = "grpc.client"; e.target_node = std::move(target); e.topic = std::move(topic);
     e.created_monotonic_ns = cabinflow::runtime::SteadyClock{}.now_monotonic_ns();
     e.ttl_ms = 300'000; e.is_final = true;
     return message;
@@ -193,7 +145,8 @@ cabinflow::agent::v1::VoiceTaskResult terminal(Client& client, const Message& in
     cabinflow::agent::v1::VoiceTaskResult result;
     require(result.ParseFromString(message.payload) && result.request_message_id() == input.envelope.message_id,
             "typed result explicit request association");
-    require(result.has_vehicle() && result.vehicle().simulated() && result.vehicle().has_left_front_window_open(),
+    require(result.has_vehicle() && result.vehicle().simulated() && result.vehicle().has_climate_on() && result.vehicle().has_action_applied() &&
+                result.vehicle().has_left_front_window_open(),
             "every task outcome carries complete simulated vehicle facts");
     return result;
 }
@@ -322,15 +275,15 @@ void window_receipts() {
         auto input = text(session + ":input", session, setup(client, session + ":setup", session), open ? "打开左前车窗" : "关闭左前车窗");
         client.send(input); const auto result = terminal(client, input, true);
         require(result.has_audio() && result.vehicle().left_front_window_open() == open && result.vehicle().climate_on() &&
-                result.vehicle().action_applied(), "TCP window OPEN/OPEN/CLOSE/CLOSE receipts preserve AC");
+                result.vehicle().action_applied(), "gRPC window OPEN/OPEN/CLOSE/CLOSE receipts preserve AC");
         client.no_response();
     }
-    require(fixture.evidence.llm_calls == 0, "TCP window controls use Router, not LLM");
+    require(fixture.evidence.llm_calls == 0, "gRPC window controls use Router, not LLM");
     { std::lock_guard<std::mutex> lock(fixture.evidence.mutex); fixture.evidence.fail_tts = true; }
     auto failed = text("window-failed-input", "window-failed", setup(client, "window-failed-setup", "window-failed"), "打开左前车窗");
     client.send(failed); const auto failure = terminal(client, failed, false);
     require(failure.has_failed() && failure.vehicle().left_front_window_open() && failure.vehicle().climate_on() &&
-            failure.vehicle().action_applied() && !failure.has_audio(), "TCP TTS failure cannot roll back window state");
+            failure.vehicle().action_applied() && !failure.has_audio(), "gRPC TTS failure cannot roll back window state");
     { std::lock_guard<std::mutex> lock(fixture.evidence.mutex); fixture.evidence.fail_tts = false; fixture.evidence.block = true; }
     auto cancelled = text("window-cancel-input", "window-cancel", setup(client, "window-cancel-setup", "window-cancel"), "关闭左前车窗");
     client.send(cancelled);
@@ -341,7 +294,22 @@ void window_receipts() {
     exit(client, "window-cancel-exit", "window-cancel", cancelled.envelope.work_id);
     fixture.release(); const auto result = terminal(client, cancelled, false);
     require(result.has_cancelled() && !result.vehicle().left_front_window_open() && result.vehicle().climate_on() &&
-            result.vehicle().action_applied() && !result.has_audio(), "TCP cancel keeps window action fact, suppresses audio");
+            result.vehicle().action_applied() && !result.has_audio(), "gRPC cancel keeps window action fact, suppresses audio");
+}
+void vehicle_status_refresh() {
+    Fixture fixture; Client client(fixture.port());
+    auto request = envelope("status-input", "status-session",
+        setup(client, "status-setup", "status-session"), "dialogue.primary",
+        "cockpit.vehicle.status.request");
+    cabinflow::agent::v1::VehicleStatusRequest body;
+    request.payload = body.SerializeAsString(); client.send(request);
+    const auto result = terminal(client, request, true);
+    require(result.has_vehicle_status() && !result.has_audio() && result.answer().empty() &&
+            !result.vehicle().climate_on() && !result.vehicle().left_front_window_open() &&
+            !result.vehicle().action_applied(), "refresh returns observed initial facts without executing actions");
+    require(fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 0,
+            "vehicle refresh bypasses generation and synthesis");
+    client.no_response();
 }
 void music_commands() {
     Fixture fixture; Client client(fixture.port());
@@ -352,14 +320,51 @@ void music_commands() {
         auto input = text(session + ":input", session, setup(client, session + ":setup", session), item.first);
         client.send(input); const auto result = terminal(client, input, true);
         require(result.has_music_command() && result.music_command().action() == item.second &&
-            !result.has_audio() && !result.vehicle().action_applied(), "real TCP transports typed non-audio instruction, not playback success");
+            !result.has_audio() && !result.vehicle().action_applied(), "real gRPC transports typed non-audio instruction, not playback success");
         if (item.second == Command::SELECT) require(result.music_command().result_index() == 2, "one-based voice selection preserved");
         client.no_response();
     }
     require(fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 0, "music skips both model generation and synthesis");
 }
+void polite_climate_commands() {
+    Fixture fixture; Client client(fixture.port());
+    fixture.evidence.fail_rag = true;
+    unsigned count = 0;
+    for (const auto* command : {"请打开空调", "请打开空调。", "请关闭空调", "请关闭空调。"}) {
+        const auto session = "polite-climate-" + std::to_string(count++);
+        auto input = text(session + ":input", session, setup(client, session + ":setup", session), command);
+        client.send(input);
+        const auto result = terminal(client, input, true);
+        require(result.transcript() == command && result.has_audio() && result.vehicle().action_applied() &&
+            result.vehicle().climate_on() == (count <= 2) && !result.vehicle().left_front_window_open(),
+            "real gRPC preserves registered polite input and returns the correct correlated climate receipt");
+        client.no_response();
+    }
+    require(fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 4,
+            "polite climate commands bypass failed RAG and LLM rather than infer actions from answers");
+}
+
+void rag_results() {
+    Fixture fixture; Client client(fixture.port());
+    fixture.evidence.rag_match = RagDocument{12, "测试章节", "测试小节", "示例空调资料", 0.8f};
+    auto input = text("rag-input", "rag-session", setup(client, "rag-setup", "rag-session"), "自动泊车怎么用");
+    client.send(input);
+    const auto matched = terminal(client, input, true);
+    require(matched.has_audio() && matched.answer().find("示例空调资料") != std::string::npos &&
+        fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 1 && !matched.vehicle().action_applied(),
+        "gRPC returns correlated RAG answer/audio without executing vehicle action");
+    client.no_response();
+    fixture.evidence.fail_rag = true;
+    input = text("rag-fail-input", "rag-fail-session", setup(client, "rag-fail-setup", "rag-fail-session"));
+    client.send(input);
+    const auto failed = terminal(client, input, false);
+    require(failed.has_failed() && failed.failed().message() == "test RAG failure" &&
+        fixture.evidence.llm_calls == 0 && fixture.evidence.tts_calls == 1,
+        "gRPC RAG failure is final, not a normal miss or cached success");
+    client.no_response();
+}
 }  // namespace
 int main() {
-    try { success_and_invalid(); cancellation_and_busy(); invalid_exit_preserves_task(); vehicle_receipts(); window_receipts(); music_commands(); std::cout << "voice_gateway_tcp_test passed\n"; return 0; }
+    try { success_and_invalid(); cancellation_and_busy(); invalid_exit_preserves_task(); vehicle_receipts(); window_receipts(); vehicle_status_refresh(); music_commands(); polite_climate_commands(); rag_results(); std::cout << "voice_gateway_grpc_test passed\n"; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

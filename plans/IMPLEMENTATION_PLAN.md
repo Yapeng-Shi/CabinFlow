@@ -1,5 +1,50 @@
 # CabinFlow Demo 实施计划
 
+## 2026-10-13 已批准扩展：本地唤醒与单轮录音（验收未完成）
+
+用户确认“你好，小舱”本地唤醒 → 显示提示 → 单轮指令 → 完整 WAV 复用现有链。
+固定规则：5 秒未开口取消本轮；Silero VAD 连续静音 0.8 秒结束；总录音最长 15 秒，超限不截断提交。
+麦克风默认关闭、用户可见启用；任务/音乐操作/回答播放期间暂停，不做连续对话和播报打断。
+
+采音、KWS/VAD 推理在客户端 C++ 独立 worker，不在 QML/GUI 线程，也不增加 Runtime、gRPC/CAN 的业务依赖。
+旧 ASR/LLM/TTS 不替换；唯一独立 KWS 与固定 Silero VAD v5.0 使用已有 Sherpa 1.11.3。
+
+代码已接入，确定性状态/协议测试通过，但合成“你好，小舱”未检出；上游同版本 CLI 也复现。
+用户追加确认“先打通”，不等待本人录音，并明确不增加直接录音按钮。生产仍只有关键词采音入口；测试端口注入已登记 WAV → 真实 gRPC/ASR/Router/RAG/LLM/TTS → WSLg PlayingState → 关闭已通过，报告明确 KWS/麦克风未运行。接线与模型/真实设备质量分开验收。
+保持失败证据，不强制唤醒、不换词、不降阈值或以测试替身算真实成功。本人录音与 WSLg 实际采集、VAD 正常终止及真实关键词闭环仍待验收，不阻塞已批准的系统接线工作。
+详见[实现、命令和未完成项](../agent/docs/wake-input-20261013.md)。本节取代下方首版不做唤醒的范围限制，不扩大其他边界。
+
+## 2026-10-13 语音可用性完善：先对齐原输入合同
+
+用户在系统完整性检查后要求“开始完善”。本步只补原登记语料中的完整空调表达：`请打开空调`、`请打开空调。`、`请关闭空调`、`请关闭空调。`；原指令保持，不泛化关键词、否定、问句、引述或多动作句，不改模型、Runtime、gRPC/CAN 协议。
+
+执行状态：原语料驱动的 Pipeline 测试、四种表达的 gRPC 关联测试和 12 条零误动作反例已补齐；Debug 39/39、限定 Pipeline ASan/LSan 1/1、真实模型/TTS/vcan 四种表达均通过。原语音文件、参考和历史失败记录保持不变。独立上游 CLI 在原 44.1kHz 与准备后的 16kHz 音频上仍复现转写问题，不能把本次意图修正称为 ASR 质量通过。[本步证据与边界](../agent/docs/voice-usability-20261013.md)。
+
+后续用户已确认本地唤醒与录音规则，以本页最上方扩展为准；不把方向确认或工程测试当作真实唤醒通过。
+
+## 2026-10-11 已批准扩展：恢复旧 Agent 业务能力
+
+用户要求把原项目功能加回当前 Demo，按最小交互链逐项恢复：先 RAG/原分级路由，再评估麦克风/流式 ASR，最后流式 LLM、句级 TTS 与播放队列。不是旧 Infra 逐文件复刻，也不扩大 Runtime 的职责。
+
+- 保留原 EMERGENCY/FACTUAL → RAG_ONLY、CREATIVE → LLM_ONLY、COMPLEX/UNKNOWN → HYBRID。用户明确批准 HYBRID **正常无命中**转 LLM；检索错误、取消、损坏结果仍终止，不作为无命中。
+- 用户批准仅 RAG 恢复 Python/Transformers，经 C++ `RagBackend` 接入；一个后端进程只装配一个 RAG 实现。失败的 llama.cpp BERT 候选源码已撤下，对照失败证据保留，不作为回退。
+- 通用 Runtime、gRPC/CAN 边界、现有非思考 Qwen3-0.6B 均不改变。历史知识库只作为示例，标题/正文错配与资料质量单独记录，不宣称真实车辆手册。
+- 当前代码已接通 `rag.primary`、类型化路由/结果、CLI/server/启动脚本；真实文本及 Qt/gRPC RAG_ONLY → TTS/播放状态、Debug 39/39、57/57 模型/索引对照和 3/3 启动失败检查已通过。Sol max 审查未发现可证明 P1/P2，旧 sanitizer/模型质量问题仍未关闭，详见[恢复记录](../agent/docs/rag-restoration-20261011.md)。麦克风、流式上传/输出和句级播放队列仍未实施。
+
+本节取代下方首版“RAG 后置”限制，不覆盖其余未批准的能力边界。下面按日期保留历史计划和验收记录，不能把当年的命令直接用于当前接口。
+
+## 2026-10-06 已批准扩展：gRPC 与虚拟 CAN
+
+此项取代下方首版“不做 vcan”和外部 TCP 的限制，历史记录保留。只迁移 Qt/Gateway 外部接入为 `RuntimeGateway.Connect` 双向 Protobuf 流，内部 Transport/Runtime 不改；生产不保留 TCP 回退。
+
+车辆生产路径改为 SocketCAN/vcan0 → 独立 ECU → 执行回执，空调/左前窗未知状态不得显示关闭。命令 2 秒期限、不重发；超时后车控等待用户明确刷新，普通问答/音乐仍允许。FakeVehicle 仅用于测试。CAN 与 gRPC 生命周期、取消提交边界须经 Sol max 独立审查。
+
+原 WSL 内核 `CONFIG_CAN_VCAN is not set`。用户于 2026-10-07 批准准备并切换同基线自定义内核、修改全局 `.wslconfig` 与重启 WSL；执行前备份配置，使用同一构建的完整匹配模块。交付必须区分代码/单测、gRPC 真实流、vcan 真实总线与硬件验证。在线音乐待授权的既有边界不变。[环境启用记录](../agent/docs/wsl-vcan-20261007.md)。
+
+执行状态（2026-10-07）：外部 gRPC、SocketCAN 后端、独立 ECU、刷新 UI、脚本及文档已实现；匹配 WSL 内核/模块已启用，Debug 37/37、Python 28/28。真实 vcan 集成与限定 CAN ASan/TSan、真实模型/Wayland Qt/gRPC/车辆回执闭环已通过。首次总线验收暴露的 CAN filter 错误已修复。Qt 音频 LSan、gRPC TSan、模型质量与人工听验仍未通过；不是全计划完成。[迁移证据](../agent/docs/grpc-can-migration-20261006.md)与[环境/实总线验收](../agent/docs/wsl-vcan-20261007.md)。
+
+2026-10-07 安全收尾补证：新增服务端 Shutdown/在途写/双 worker、Qt 旧代通知隔离、连接中关闭回归；Debug 全套 37/37、stream repeat5、Qt repeat3、限定 gRPC ASan/LSan 4/4。gRPC TSan 四项仍失败，最小 gRPC API 对照也报告，但不足以证明全部误报；Qt LSan 复跑仍失败。只补测试和证据，未扩 Runtime、换模型或隐藏检测；安全收尾未标完成。[本轮命令、审查及未完成项](../agent/docs/grpc-safety-20261007.md)。
+
 > 先做出一个能听、能答、能播放、能取消的离线座舱语音 Demo。
 
 更新日期：2026-10-04。用户已确认改为 Demo 优先，取代此前“先完成全部 Runtime 迁移收尾、暂停模型工作”的安排。实现和验证进度见第 9 节，不把计划本身当作完成证据。
